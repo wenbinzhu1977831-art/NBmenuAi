@@ -1541,26 +1541,6 @@ function App() {
             {activeTab === 'config' && (
               sysRole !== 'admin' ? <LockedView t={t} /> :
               <div className="space-y-6">
-                <Card title="Data Backup & Logs" icon={<Save size={20} className="text-indigo-400" />}>
-                  <div className="flex flex-col md:flex-row gap-4">
-                    <button 
-                      onClick={() => window.open(`${API_URL}/backup/db?token=${sysToken}`, '_blank')}
-                      className="flex-1 flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-3 rounded-lg shadow-lg transition-all font-medium text-sm border border-indigo-500/50"
-                    >
-                      <Save size={18} /> Backup Database (app.db)
-                    </button>
-                    <button 
-                      onClick={() => window.open(`${API_URL}/backup/log?token=${sysToken}`, '_blank')}
-                      className="flex-1 flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-200 px-4 py-3 rounded-lg shadow-lg transition-all font-medium text-sm border border-slate-600"
-                    >
-                      <FileText size={18} /> Download Server Log
-                    </button>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-3 flex items-start gap-1">
-                    <span className="text-yellow-500">⚠</span>
-                    Cloud Run restores the database to the deployment state on every update. Please download your database backup before deploying new code!
-                  </p>
-                </Card>
 
                 <Card title={t('apiKeys')}>
                   <div className="space-y-4">
