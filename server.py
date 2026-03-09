@@ -529,16 +529,12 @@ async def download_server_log(token: str = None):
 @app.get("/api/admin/menu")
 async def get_menu(role: str = Depends(verify_admin)):
     """
-    读取 menu.json 文件原始内容，供前端 JSON 编辑器使用。
-
-    Returns:
-        dict: {"content": "<menu.json 的字符串内容>"}
-              文件不存在时返回 {"content": "[]"}
+    读取菜单数据。
+    丰山云生产环境和本地开发均从 Cloud SQL / SQLite 数据库读取。
+    返回与原来 menu.json 格式完全异法 的 JSON 字符串。
     """
-    if os.path.exists(config.menu_file):
-        with open(config.menu_file, "r", encoding="utf-8") as f:
-            return {"content": f.read()}
-    return {"content": "[]"}
+    menu_dict = database.load_menu()
+    return {"content": json.dumps(menu_dict, indent=4, ensure_ascii=False)}
 
 
 class MenuUpdate(BaseModel):
@@ -547,104 +543,125 @@ class MenuUpdate(BaseModel):
 
 
 @app.post("/api/admin/menu")
-async def save_menu(payload: MenuUpdate):
+async def save_menu(payload: MenuUpdate, role: str = Depends(verify_admin)):
     """
-    保存菜单更改，包含 JSON 校验、自动备份和热重载。
-
-    操作流程：
-        1. 验证传入内容是否为合法 JSON（防止保存损坏的数据）
-        2. 将当前菜单备份到 backups/ 目录（时间戳命名）
-        3. 将格式化后的新菜单写入 menu.json
-        4. 清除 lru_cache 并热重载，使内存中的菜单立即更新
-
-    Returns:
-        dict: {"status": "success", "message": "..."}
-
-    Raises:
-        400: JSON 格式错误
-        500: 文件操作失败
+    将前端提交的菜单 JSON 写入 Cloud SQL（生产）或 SQLite（本地）。
+    
+    格式要求：{"Category": [{"name": ..., "price": ..., ...}]}
     """
     try:
-        # 步骤1：验证 JSON 格式（若格式错误，json.loads 会抛出 JSONDecodeError）
         json_data = json.loads(payload.content)
+        if not isinstance(json_data, dict):
+            raise HTTPException(status_code=400, detail="Menu must be a JSON object (dict of categories)")
 
-        # 步骤2：备份当前菜单
-        if os.path.exists(config.menu_file):
-            backup_dir = "backups"
-            os.makedirs(backup_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = os.path.join(backup_dir, f"menu.json.{timestamp}.bak")
-            import shutil
-            shutil.copy2(config.menu_file, backup_path)
+        with database.get_db_session() as db:
+            from models import MenuCategory, MenuItem, MenuOption
 
-        # 步骤3：格式化写入新菜单
-        with open(config.menu_file, "w", encoding="utf-8") as f:
-            json.dump(json_data, f, indent=4, ensure_ascii=False)
+            # 删除所有现有菜单数据（重建）
+            db.query(MenuOption).delete()
+            db.query(MenuItem).delete()
+            db.query(MenuCategory).delete()
 
-        # 步骤4：[BUG FIX] 必须先清除 lru_cache 再重新加载，否则热重载无效
-        import database
+            for display_order, (category_name, items) in enumerate(json_data.items()):
+                category = MenuCategory(
+                    name=category_name,
+                    display_order=display_order
+                )
+                db.add(category)
+
+                if isinstance(items, list):
+                    for item_data in items:
+                        item = MenuItem(
+                            category_name=category_name,
+                            name=item_data.get('name', 'Unnamed Item'),
+                            price=float(item_data.get('price', 0.0)),
+                            description=item_data.get('description'),
+                            allergens=item_data.get('allergens'),
+                        )
+                        db.add(item)
+                        db.flush()  # 获取 item.id
+
+                        # 处理 Options
+                        for option_group in (item_data.get('options') or []):
+                            group_name = option_group.get('name', 'OPTIONS')
+                            for val in (option_group.get('values') or []):
+                                opt = MenuOption(
+                                    item_id=item.id,
+                                    name=f"{group_name}: {val['name']}",
+                                    price_change=float(val.get('price_mod', 0.0)),
+                                    is_default=bool(val.get('default', False)),
+                                )
+                                db.add(opt)
+
+            db.commit()
+
+        # 清除菜单缓存，使新菜单立即生效
         database.load_menu.cache_clear()
         database.load_menu()
 
-        return {"status": "success", "message": "Menu saved successfully"}
+        return {"status": "success", "message": f"菜单已保存到数据库 ({len(json_data)} 个分类)"}
 
     except json.JSONDecodeError as e:
-        logger.error(f"菜单 JSON 格式错误: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid JSON format. {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}")
     except Exception as e:
         logger.error(f"菜单保存失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/admin/menu/factory-reset")
-async def factory_reset_menu():
+async def factory_reset_menu(role: str = Depends(verify_admin)):
     """
-    恢复出厂默认菜单（从 menu_factory.json 覆盖 menu.json）。
-
-    操作流程：
-        1. 检查 menu_factory.json 是否存在
-        2. 备份当前菜单
-        3. 用出厂菜单覆盖当前菜单文件
-        4. 清除缓存并热重载
-        5. 返回新菜单内容供前端同步更新编辑器
-
-    Returns:
-        dict: {"status": "success", "content": "<新菜单内容>"}
-
-    Raises:
-        404: 出厂默认菜单文件不存在
-        500: 文件操作失败
+    从 Docker 镜像内置的 menu_factory.json（或 menu.json）恢复出厂默认菜单，
+    并将其写入 Cloud SQL 数据库。
     """
-    factory_file = "menu_factory.json"
+    # 优先找 menu_factory.json，否则用 menu.json（镜像里的原版）
+    factory_file = "menu_factory.json" if os.path.exists("menu_factory.json") else "menu.json"
     if not os.path.exists(factory_file):
-        raise HTTPException(status_code=404, detail="Factory default menu not found.")
+        raise HTTPException(status_code=404, detail="Factory default menu file not found in image.")
 
     try:
-        import shutil
+        with open(factory_file, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
 
-        # 步骤1：备份当前菜单
-        if os.path.exists(config.menu_file):
-            backup_dir = "backups"
-            os.makedirs(backup_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = os.path.join(backup_dir, f"menu.json.{timestamp}.bak")
-            shutil.copy2(config.menu_file, backup_path)
+        with database.get_db_session() as db:
+            from models import MenuCategory, MenuItem, MenuOption
+            db.query(MenuOption).delete()
+            db.query(MenuItem).delete()
+            db.query(MenuCategory).delete()
 
-        # 步骤2：用出厂菜单覆盖当前菜单
-        shutil.copy2(factory_file, config.menu_file)
+            for display_order, (category_name, items) in enumerate(json_data.items()):
+                db.add(MenuCategory(name=category_name, display_order=display_order))
+                if isinstance(items, list):
+                    for item_data in items:
+                        item = MenuItem(
+                            category_name=category_name,
+                            name=item_data.get('name', 'Unnamed Item'),
+                            price=float(item_data.get('price', 0.0)),
+                            description=item_data.get('description'),
+                            allergens=item_data.get('allergens'),
+                        )
+                        db.add(item)
+                        db.flush()
+                        for option_group in (item_data.get('options') or []):
+                            group_name = option_group.get('name', 'OPTIONS')
+                            for val in (option_group.get('values') or []):
+                                db.add(MenuOption(
+                                    item_id=item.id,
+                                    name=f"{group_name}: {val['name']}",
+                                    price_change=float(val.get('price_mod', 0.0)),
+                                    is_default=bool(val.get('default', False)),
+                                ))
+            db.commit()
 
-        # 步骤3：[BUG FIX] 清除缓存后热重载
-        import database
         database.load_menu.cache_clear()
         database.load_menu()
 
-        # 返回新菜单内容，前端可用此内容同步更新编辑器界面
-        with open(config.menu_file, "r", encoding="utf-8") as f:
-            return {"status": "success", "content": f.read()}
+        return {"status": "success", "content": json.dumps(json_data, indent=4, ensure_ascii=False)}
 
     except Exception as e:
         logger.error(f"Factory Reset 失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # --- 配送区域管理 API ---
