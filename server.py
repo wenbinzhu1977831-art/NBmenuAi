@@ -480,16 +480,24 @@ async def update_settings(update_data: SettingsUpdate, role: str = Depends(verif
 
 @app.get("/api/admin/backup/db")
 async def download_database(token: str = None):
-    """下载 SQLite 数据库备份 (app.db)，URL 参数鉴权"""
+    """下载数据库备份。本地 SQLite 环境返回 app.db 文件；Cloud SQL 生产环境提示使用 GCP 控制台。"""
     if not token or token not in TOKEN_STORE or TOKEN_STORE[token]["role"] != "admin":
         raise HTTPException(status_code=403, detail="Admin token required via query parameter")
-        
+
+    # Cloud SQL 生产环境：app.db 不存在，引导用户使用 GCP 控制台备份
+    if os.environ.get("CLOUD_SQL_CONNECTION_NAME"):
+        raise HTTPException(
+            status_code=503,
+            detail="生产环境使用 Cloud SQL，请在 GCP 控制台 → Cloud SQL → 导出 功能进行数据库备份。"
+        )
+
+    # 本地开发环境：直接下载 app.db
     db_path = "app.db"
     if not os.path.exists(db_path):
         raise HTTPException(status_code=404, detail="Database file not found.")
     return FileResponse(
-        path=db_path, 
-        filename=f"app_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db", 
+        path=db_path,
+        filename=f"app_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
         media_type="application/octet-stream"
     )
 
@@ -916,11 +924,12 @@ async def get_dashboard_stats(role: str = Depends(get_current_role)):
 
 
 # ===== 执行启动后业务逻辑 =====
-# 验证 SQLite 数据库是否可用
-if not database.init_db():
-    logger.warning("数据库初始化失败或不存在，系统可能无法正常工作。")
-else:
+# 触发数据库懒初始化（首次访问时自动连接 SQLite 或 Cloud SQL）
+try:
+    database._get_session_factory()  # 触发初始化
     logger.info("✅ 数据库系统就绪")
+except Exception as _db_init_err:
+    logger.warning(f"⚠️ 数据库初始化失败，系统可能无法正常工作: {_db_init_err}")
     
 try:
     # 在此处预加载打字音效掩盖延迟
