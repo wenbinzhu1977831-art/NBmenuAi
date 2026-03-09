@@ -851,7 +851,7 @@ function App() {
           <NavItem icon={<BarChart2 />} label={t('analytics')} active={activeTab === 'analytics'} onClick={() => navigateTo('analytics')} />
           <NavItem icon={<Bot />} label={t('ai')} active={activeTab === 'ai'} onClick={() => navigateTo('ai')} locked={sysRole === 'staff'} />
           <NavItem icon={<BookOpen />} label={t('menu')} active={activeTab === 'menu'} onClick={() => navigateTo('menu')} locked={sysRole === 'staff'} />
-          <NavItem icon={<Code />} label={t('tools')} active={activeTab === 'tools'} onClick={() => navigateTo('tools')} locked={sysRole === 'staff'} />
+
           <NavItem icon={<Settings />} label={t('config')} active={activeTab === 'config'} onClick={() => navigateTo('config')} locked={sysRole === 'staff'} />
         </nav>
         
@@ -1536,13 +1536,6 @@ function App() {
               </div>
             )}
 
-            {/* ---- TAB: TOOLS & SCRIPTS ---- */}
-            {activeTab === 'tools' && (
-              sysRole !== 'admin' ? <LockedView t={t} /> :
-              <div className="h-[95%]">
-                <CodeEditor lang={lang} t={t} /> {/* CodeEditor will need its own translation if desired, but passing props is easy. We will leave inner component alone for now */}
-              </div>
-            )}
 
             {/* ---- TAB: CONFIG ---- */}
             {activeTab === 'config' && (
