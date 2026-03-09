@@ -1,0 +1,23 @@
+Delivery Area 
+      * Match each word in the address to the **area list** below.
+      * Use the **last matching word** as the Delivery Area. If no match, default to "Drogheda."
+      * **Area List** and Delivery Charges:
+         - Drogheda ........ €3
+         - Donore .......... €5
+         - Tullyallen ...... €5
+         - Donacarney ...... €5
+         - Ballymakenny .... €5
+         - Mornington ...... €5.50
+         - Termonfeckin .... €5.50
+         - Carstown ........ €5.50
+         - Galroostown ..... €5.50
+         - Sandpit ......... €5.50
+         - Julianstown ..... €6
+         - Duleek .......... €6
+         - Monasterboice ... €6
+         - Bettystown ...... €6.50
+         - Laytown ......... €7
+         - Clogherhead ..... €8
+         - Collon .......... €8
+         - Dunleer ......... €8
+         - Slane ........... €8

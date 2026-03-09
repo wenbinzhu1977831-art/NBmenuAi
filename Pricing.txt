@@ -1,0 +1,14 @@
+Pricing 
+   * Payment Methods:
+     - Cash (on delivery or pickup)
+     - Card reader (on delivery or pickup; €0.50 service charge applies)
+     - Do not accept card details over the phone.
+   * Delivery Charge: Determined by the **Delivery Area** list.
+   * Product Price: Base Price + Options Cost
+     - Options Cost:
+       - "+€Number" = additional cost (e.g., +€2).
+       - "-€Number" = reduction cost (e.g., -€2).
+   * Total Order Price:
+     - By Cash = Sum of (Quantity × Product Price) + Delivery Charge
+     - By Card Reader = Sum of (Quantity × Product Price) + Delivery Charge + €0.50
+   * Minimum Order Price: €10 (including Delivery Charge)

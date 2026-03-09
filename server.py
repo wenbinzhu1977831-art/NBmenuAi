@@ -1,0 +1,2937 @@
+"""
+server.py — AI 智能电话点餐系统主服务
+
+系统架构概览：
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  外部来电                                                             │
+    │    │                                                                 │
+    │  Twilio (电话网络)                                                    │
+    │    │ POST /incoming-call (TwiML 路由判断)                             │
+    │    │                                                                 │
+    │    ├─ master_switch=offline → 播放离线消息/拒接                        │
+    │    ├─ master_switch=bypass  → 直接转人工                              │
+    │    ├─ 并发超限               → 溢出处理（转接或拒绝）                   │
+    │    └─ 正常                  → 建立 WebSocket 媒体流                   │
+    │                                    │                                 │
+    │                             WS /media-stream                         │
+    │                             ┌──────┴──────────────────────┐          │
+    │                             │  双向音频桥接核心             │          │
+    │                             │                             │          │
+    │  Twilio(mu-law 8k) ──解码──▶│ receive_from_twilio()       │          │
+    │                   ──上采样──▶│  → PCM 16k → Gemini        │          │
+    │                             │                             │          │
+    │  Gemini(PCM 24k) ──下采样──▶│ receive_from_gemini()       │          │
+    │                   ──编码───▶│  → mu-law 8k → Twilio      │          │
+    │                             │  → 工具调用分发              │          │
+    │                             └─────────────────────────────┘          │
+    │                                                                       │
+    │  管理面板 (前端 Vue/React)                                             │
+    │    WS /api/admin/ws          ← 实时推送（字幕、通话状态、订单）         │
+    │    HTTP /api/admin/*         ← 配置读写、菜单管理、代码编辑             │
+    │    WS /api/admin/web_call    ← Web 模拟电话测试                       │
+    └─────────────────────────────────────────────────────────────────────┘
+
+关键技术点：
+    1. 音频转码：Twilio 使用 mu-law 8kHz，Gemini 使用 PCM 16kHz/24kHz
+    2. 双向并发：两个独立异步任务分别处理 Twilio→Gemini 和 Gemini→Twilio
+    3. 工具调用：Gemini 通过 Function Calling 触发地址验证、价格计算、挂断/转接
+    4. 打断处理：检测用户打断信号，但过滤掉 ≤1 个单词的噪音误触发
+    5. 热重载：所有业务配置支持通过管理面板实时修改，无需重启服务
+
+运行方式：
+    python server.py
+    (需先运行 ngrok http 5000 获取公网地址并配置到 Twilio Webhook)
+"""
+
+import sys
+import io
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+import os
+import json
+import base64
+import asyncio
+import audioop       # 音频编解码（mu-law ↔ PCM 转换）
+import logging
+import timeit        # 精确计时（保留导入，部分调试场景使用）
+import uuid          # 生成唯一订单 ID
+import time
+from datetime import datetime, timedelta
+from fastapi import FastAPI, WebSocket, Request, HTTPException, status, Depends, BackgroundTasks
+from fastapi.responses import Response, JSONResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+import secrets
+from fastapi.staticfiles import StaticFiles
+from websockets.client import connect as ws_connect      # 连接 Gemini WebSocket 服务端
+from websockets.exceptions import ConnectionClosed       # WebSocket 连接关闭异常
+from fastapi.websockets import WebSocketDisconnect       # FastAPI WebSocket 断开异常
+from pydantic import BaseModel
+from typing import Dict, Any
+
+# 解决 Windows 终端中 ANSI 颜色转义码无法正确显示的问题
+# 调用后，print("\033[93m黄色\033[0m") 等彩色输出才能在 PowerShell/CMD 中正常显示
+import colorama
+colorama.init()
+
+# 业务逻辑模块
+import database         # 数据持久化（菜单、客户、订单）
+import tools_address    # AI 工具：爱尔兰地址搜索验证
+import tools_pricing    # AI 工具：订单价格计算
+import tools_manage_call  # AI 工具：通话控制（挂断/转接）
+import tools_history    # AI 工具：历史订单查询
+# 导入键盘打字音效注入工具
+import audio_injector
+import prompts          # AI 系统指令生成器
+
+# 从配置管理模块导入全局唯一配置实例
+from config import config
+
+# =============================================================================
+# 日志配置
+# 格式：时间戳 - 日志级别 - 消息
+# 示例：2025-12-27 16:34:45,123 - INFO - 来电号码: +353871234567
+# =============================================================================
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("server.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("AI-Waiter")
+
+
+# =============================================================================
+# 业务日期计算辅助函数
+# =============================================================================
+
+def get_business_date_str(timestamp_seconds=None):
+    """
+    计算"逻辑业务日期"的字符串表示（如 'Sat Dec 27'）。
+
+    问题背景：
+        餐厅通常营业到凌晨（如 23:00~01:00）。
+        如果以自然日计算，凌晨 1:00 的订单属于第二天，
+        但在业务上它应该算作前一天（同一个"营业日"）的订单。
+
+    解决方案：
+        将时间戳向前偏移 business_day_start_hour 小时（默认 5 小时）：
+        - 凌晨 1:00 减去 5 小时 = 前一天 20:00 → 计入前一天
+        - 早上 6:00 减去 5 小时 = 当天 1:00   → 计入当天
+
+    Args:
+        timestamp_seconds (float, optional): Unix 时间戳（秒）；
+                                             为 None 时使用当前时间
+
+    Returns:
+        str: 格式化的业务日期字符串，如 "Sat Dec 27"
+             用于与订单 timestamp 字段的日期部分进行比较
+
+    注意：
+        business_day_start_hour 从 config 中读取（使用 getattr 提供默认值 5），
+        将来可通过在 AppConfig 中添加此字段使其可配置。
+    """
+    dt = datetime.fromtimestamp(timestamp_seconds) if timestamp_seconds else datetime.now()
+    # 向前偏移 start_hour 小时，实现"业务日"的时间边界
+    start_hour = int(getattr(config, 'business_day_start_hour', 7))
+    logical_dt = dt - timedelta(hours=start_hour)
+    return logical_dt.strftime("%a %b %d")
+
+
+# =============================================================================
+# FastAPI 应用实例
+# =============================================================================
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 服务启动前执行：加载并预转码打字音效
+    logger.info("系统启动：预加载音频资产...")
+    import audio_injector
+    audio_injector.load_typing_audio("键盘.wav")
+    yield
+    # 服务关闭时清理 (预留)
+    logger.info("系统关闭。")
+
+app = FastAPI(lifespan=lifespan)
+
+
+
+def get_order_counts():
+    """
+    统计今日订单数 (SQLite)：返回 (completed_count, incomplete_count)
+    """
+    completed, incomplete = 0, 0
+    try:
+        from database import get_db_session
+        from models import Order
+        today_str = get_business_date_str()
+        
+        with get_db_session() as db:
+            orders = db.query(Order).filter_by(business_date=today_str).all()
+            for o in orders:
+                if o.source and "Incomplete" in o.source:
+                    incomplete += 1
+                elif o.source and o.source.startswith("AI"):
+                    completed += 1
+    except Exception as e:
+        logger.error(f"get_order_counts 失败: {e}")
+    return completed, incomplete
+
+# 跨域资源共享（CORS）配置
+# 允许前端在开发阶段（不同端口）或其他域名访问此 API
+# 生产环境建议将 allow_origins 限制为具体的前端域名
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # 允许所有来源（开发阶段）
+    allow_credentials=True,
+    allow_methods=["*"],       # 允许所有 HTTP 方法
+    allow_headers=["*"],       # 允许所有请求头
+)
+
+# 前端静态文件服务（生产环境/Docker 部署）
+# 如果 frontend/dist 目录存在（由 npm run build 生成），
+# 则将其 assets 子目录作为静态文件服务挂载到 /assets 路径
+# 同时 /index.html 由 serve_frontend() 路由处理
+frontend_dist_path = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+if os.path.isdir(frontend_dist_path):
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(frontend_dist_path, "assets")),
+        name="assets"
+    )
+
+
+# =============================================================================
+# 全局状态字典
+# =============================================================================
+
+# 通话意图状态字典：记录每个 CallSid 的挂断/转接意图
+# 键：CallSid（Twilio 通话唯一标识）
+# 值：{"intent": "hangup"/"transfer", "reason": "..."}
+# 生命周期：从 AI 调用 end_call/transfer_call 工具时写入，
+#           在 /stream-ended 路由读取并清除
+CALL_STATES = {}
+
+# 活跃通话字典：跟踪当前正在进行的通话
+# 键：CallSid
+# 值：{"start_time": float, "caller_number": str, "caller_name": str}
+# 用途：
+#   1. 并发控制（与 config.max_concurrent_calls 比较）
+#   2. 管理面板实时展示当前通话数量和详情
+ACTIVE_CALLS = {}
+
+# 电话排队等待全局锁与队列
+# 当 global_ai_busy 为 True 时，新进来的通话将进入等候室 (Twilio <Enqueue>)
+global_ai_busy = False
+waiting_calls = []  # 列表，存放形如 {"call_sid": "...", "account_sid": "...", "number": "...", "joined_at": 12345}
+
+
+# =============================================================================
+# 管理面板 WebSocket 广播机制
+# =============================================================================
+
+# 所有已连接的管理面板 WebSocket 客户端集合
+# 使用 set 存储，自动去重，方便批量广播
+ADMIN_CLIENTS = set()
+
+
+async def broadcast_admin(event: str, data: dict):
+    """
+    向所有已连接的管理面板前端推送实时事件消息。
+
+    消息格式（JSON）：
+        {"event": "<事件名>", "data": {...}}
+
+    支持的事件类型：
+        "sync"         — 初次连接时同步当前通话状态
+        "call_start"   — 新通话开始（含来电号码、姓名、当前并发数）
+        "call_end"     — 通话结束（含当前并发数）
+        "transcript"   — 实时字幕流（用户/AI 的文字）
+        "tool_call"    — AI 调用工具时（供调试）
+        "tool_response"— 工具返回结果时（供调试）
+        "new_order"    — 新订单归档后（含今日 AI 订单总数）
+        "system_log"   — 系统日志消息（连接/断开等状态）
+
+    容错机制：
+        遍历过程中若某个客户端已断开，发送会抛出异常，
+        将其加入 disconnected 集合，遍历结束后统一清除，
+        避免在遍历过程中修改集合（会导致 RuntimeError）。
+
+    Args:
+        event (str): 事件名称字符串
+        data (dict): 事件携带的数据字典
+    """
+    message = json.dumps({"event": event, "data": data})
+    disconnected = set()  # 收集发送失败的断开客户端
+
+    for ws in ADMIN_CLIENTS:
+        try:
+            await ws.send_text(message)
+        except Exception:
+            # 发送失败说明客户端已断开，标记待清除
+            disconnected.add(ws)
+
+    # 清除已断开的客户端
+    for ws in disconnected:
+        ADMIN_CLIENTS.remove(ws)
+
+
+# =============================================================================
+# 双层权限认证系统 (Admin vs Staff)
+# =============================================================================
+
+# 统一 Token 存储池 (内存字典)
+# 结构: { "token_string": {"role": "admin"|"staff", "expires": timestamp} }
+TOKEN_STORE = {}
+
+class LoginRequest(BaseModel):
+    password: str = None
+    role: str = None
+
+@app.post("/api/admin/login")
+async def admin_login(req: LoginRequest):
+    """
+    处理登录请求并下发轻量级 Token。
+    双通路设计：
+        1. req.role == 'staff': 颁发普通店员凭证 (只能看看板，不能修改)
+        2. req.password == CONFIG_PWD: 颁发最高管理员凭证
+    """
+    # 1. 员工无密码直接发 token
+    if req.role == "staff":
+        token = secrets.token_hex(16)
+        TOKEN_STORE[token] = {"role": "staff", "expires": time.time() + 86400 * 7}
+        return {"token": token, "role": "staff"}
+    
+    # 2. 管理员需密码校验
+    if req.password == config.admin_password:
+        token = secrets.token_hex(16)
+        TOKEN_STORE[token] = {"role": "admin", "expires": time.time() + 86400 * 7}
+        return {"token": token, "role": "admin"}
+    
+    raise HTTPException(status_code=401, detail="Invalid password")
+
+class PasswordChangeRequest(BaseModel):
+    new_password: str
+
+async def verify_token(authorization: str = None):
+    """基础凭证拦截器：提取 Authorization Header 中的 Bearer Token 并校验"""
+    # 注意：为了让拦截器纯粹，这里手工从 header 或 Depends 抓取
+    pass # 被 OAuth2 替代
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/admin/login", auto_error=False)
+
+async def get_current_role(token: str = Depends(oauth2_scheme)):
+    """验证 Token 是否有效并返回角色 (admin/staff)"""
+    if not token or token not in TOKEN_STORE:
+        raise HTTPException(status_code=401, detail="Invalid or missing token")
+    
+    info = TOKEN_STORE[token]
+    if time.time() > info["expires"]:
+        del TOKEN_STORE[token]
+        raise HTTPException(status_code=401, detail="Token expired")
+    
+    return info["role"]
+
+async def verify_admin(role: str = Depends(get_current_role)):
+    """高级凭证拦截器：阻断 staff，仅允许 admin 放行"""
+    if role != "admin":
+        raise HTTPException(status_code=403, detail="Admin privileges required for this action")
+    return role
+
+@app.post("/api/admin/change-password")
+async def change_password(req: PasswordChangeRequest, role: str = Depends(verify_admin)):
+    """管理员在线重置系统密码。重置后销毁所有旧 Token 迫使所有人重新登录"""
+    try:
+        settings_data = {}
+        if os.path.exists(config.settings_file):
+            with open(config.settings_file, "r", encoding="utf-8") as f:
+                settings_data = json.load(f)
+        
+        if "security_settings" not in settings_data:
+            settings_data["security_settings"] = {}
+        settings_data["security_settings"]["admin_password"] = req.new_password
+        
+        with open(config.settings_file, "w", encoding="utf-8") as f:
+            json.dump(settings_data, f, indent=2, ensure_ascii=False)
+            
+        # 让 Config 单例热重载新密码
+        config.reload_settings()
+        
+        # 踢下线所有人
+        TOKEN_STORE.clear()
+        
+        return {"status": "success", "message": "Password updated successfully."}
+    except Exception as e:
+        logger.error(f"Failed to change password: {e}")
+        raise HTTPException(status_code=500, detail="Failed to write password setting")
+
+
+# =============================================================================
+# 管理面板 API 路由
+# 均受 Token 保护。基础查看受 get_current_role 保护，写配置受 verify_admin 保护。
+# =============================================================================
+
+@app.websocket("/api/admin/ws")
+async def admin_websocket(websocket: WebSocket, token: str = None):
+    """
+    管理面板实时通信 WebSocket 端点 (Token Query 鉴权)。
+    """
+    if not token or token not in TOKEN_STORE:
+        await websocket.close(code=1008)
+        return
+    
+    if time.time() > TOKEN_STORE[token]["expires"]:
+        del TOKEN_STORE[token]
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    ADMIN_CLIENTS.add(websocket)
+
+    # --- 发送初始同步数据：当前活跃通话状态 ---
+    await websocket.send_text(json.dumps({
+        "event": "sync",
+        "data": {
+            "active_calls_count": len(ACTIVE_CALLS),
+            "active_calls": ACTIVE_CALLS  # 完整字典，含每个通话的详细信息
+        }
+    }))
+
+    # --- 发送今日 AI 订单计数（初始同步，含草稿数）---
+    completed, incomplete = get_order_counts()
+    await websocket.send_json({
+        "event": "new_order",
+        "data": {
+            "total_orders": completed,
+            "incomplete_orders": incomplete,
+            "order_id": None
+        }
+    })
+
+    # --- 保持连接：等待前端发送任何消息（心跳）---
+    try:
+        while True:
+            await websocket.receive_text()  # 阻塞等待，收到任何消息都忽略
+    except WebSocketDisconnect:
+        # 前端正常关闭页面或刷新时触发
+        ADMIN_CLIENTS.discard(websocket)
+    except Exception as e:
+        logger.error(f"Admin WS 异常: {e}")
+        ADMIN_CLIENTS.discard(websocket)
+
+
+# --- 配置管理 API ---
+
+@app.get("/api/admin/settings")
+async def get_settings(role: str = Depends(get_current_role)):
+    """
+    获取 settings.json 的完整内容。
+
+    前端使用此接口加载当前配置，填充设置表单。
+    若角色为 staff，则剔除敏感信息（API Keys、密码）后回传。
+    若文件不存在（首次部署），返回空字典，前端会使用默认值。
+    """
+    if os.path.exists(config.settings_file):
+        with open(config.settings_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if role == "staff":
+                data.pop("api_keys", None)
+                data.pop("security_settings", None)
+            return data
+    return {}
+
+
+class SettingsUpdate(BaseModel):
+    """POST /api/admin/settings 的请求体模型"""
+    settings: Dict[str, Any]  # 完整的配置字典（嵌套结构，与 settings.json 格式一致）
+
+
+@app.post("/api/admin/settings")
+async def update_settings(update_data: SettingsUpdate, role: str = Depends(verify_admin)):
+    """
+    保存新的配置并立即热重载到内存。
+
+    操作流程：
+        1. 将前端提交的配置字典序列化为 JSON 写入 settings.json
+        2. 调用 config.reload_settings() 将新配置加载到内存
+           （下一个来电就会使用新配置，无需重启）
+
+    Returns:
+        dict: {"status": "success", "message": "..."}
+    """
+    try:
+        with open(config.settings_file, "w", encoding="utf-8") as f:
+            json.dump(update_data.settings, f, indent=2, ensure_ascii=False)
+        # 立即热重载，使新配置在下次 API 调用时生效
+        config.reload_settings()
+        return {"status": "success", "message": "Settings updated and reloaded"}
+    except Exception as e:
+        logger.error(f"保存配置失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 数据备份 API ---
+
+@app.get("/api/admin/backup/db")
+async def download_database(token: str = None):
+    """下载 SQLite 数据库备份 (app.db)，URL 参数鉴权"""
+    if not token or token not in TOKEN_STORE or TOKEN_STORE[token]["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin token required via query parameter")
+        
+    db_path = "app.db"
+    if not os.path.exists(db_path):
+        raise HTTPException(status_code=404, detail="Database file not found.")
+    return FileResponse(
+        path=db_path, 
+        filename=f"app_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db", 
+        media_type="application/octet-stream"
+    )
+
+@app.get("/api/admin/backup/log")
+async def download_server_log(token: str = None):
+    """下载服务器运行日志 (server.log)，URL 参数鉴权"""
+    if not token or token not in TOKEN_STORE or TOKEN_STORE[token]["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin token required via query parameter")
+        
+    log_path = "server.log"
+    if not os.path.exists(log_path):
+        raise HTTPException(status_code=404, detail="Server log not found.")
+    return FileResponse(
+        path=log_path, 
+        filename=f"server_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log", 
+        media_type="text/plain"
+    )
+
+# --- 菜单管理 API ---
+
+@app.get("/api/admin/menu")
+async def get_menu(role: str = Depends(verify_admin)):
+    """
+    读取 menu.json 文件原始内容，供前端 JSON 编辑器使用。
+
+    Returns:
+        dict: {"content": "<menu.json 的字符串内容>"}
+              文件不存在时返回 {"content": "[]"}
+    """
+    if os.path.exists(config.menu_file):
+        with open(config.menu_file, "r", encoding="utf-8") as f:
+            return {"content": f.read()}
+    return {"content": "[]"}
+
+
+class MenuUpdate(BaseModel):
+    """POST /api/admin/menu 的请求体模型"""
+    content: str  # 菜单 JSON 字符串（前端编辑器的完整内容）
+
+
+@app.post("/api/admin/menu")
+async def save_menu(payload: MenuUpdate):
+    """
+    保存菜单更改，包含 JSON 校验、自动备份和热重载。
+
+    操作流程：
+        1. 验证传入内容是否为合法 JSON（防止保存损坏的数据）
+        2. 将当前菜单备份到 backups/ 目录（时间戳命名）
+        3. 将格式化后的新菜单写入 menu.json
+        4. 清除 lru_cache 并热重载，使内存中的菜单立即更新
+
+    Returns:
+        dict: {"status": "success", "message": "..."}
+
+    Raises:
+        400: JSON 格式错误
+        500: 文件操作失败
+    """
+    try:
+        # 步骤1：验证 JSON 格式（若格式错误，json.loads 会抛出 JSONDecodeError）
+        json_data = json.loads(payload.content)
+
+        # 步骤2：备份当前菜单
+        if os.path.exists(config.menu_file):
+            backup_dir = "backups"
+            os.makedirs(backup_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(backup_dir, f"menu.json.{timestamp}.bak")
+            import shutil
+            shutil.copy2(config.menu_file, backup_path)
+
+        # 步骤3：格式化写入新菜单
+        with open(config.menu_file, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=4, ensure_ascii=False)
+
+        # 步骤4：[BUG FIX] 必须先清除 lru_cache 再重新加载，否则热重载无效
+        import database
+        database.load_menu.cache_clear()
+        database.load_menu()
+
+        return {"status": "success", "message": "Menu saved successfully"}
+
+    except json.JSONDecodeError as e:
+        logger.error(f"菜单 JSON 格式错误: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format. {e}")
+    except Exception as e:
+        logger.error(f"菜单保存失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/admin/menu/factory-reset")
+async def factory_reset_menu():
+    """
+    恢复出厂默认菜单（从 menu_factory.json 覆盖 menu.json）。
+
+    操作流程：
+        1. 检查 menu_factory.json 是否存在
+        2. 备份当前菜单
+        3. 用出厂菜单覆盖当前菜单文件
+        4. 清除缓存并热重载
+        5. 返回新菜单内容供前端同步更新编辑器
+
+    Returns:
+        dict: {"status": "success", "content": "<新菜单内容>"}
+
+    Raises:
+        404: 出厂默认菜单文件不存在
+        500: 文件操作失败
+    """
+    factory_file = "menu_factory.json"
+    if not os.path.exists(factory_file):
+        raise HTTPException(status_code=404, detail="Factory default menu not found.")
+
+    try:
+        import shutil
+
+        # 步骤1：备份当前菜单
+        if os.path.exists(config.menu_file):
+            backup_dir = "backups"
+            os.makedirs(backup_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(backup_dir, f"menu.json.{timestamp}.bak")
+            shutil.copy2(config.menu_file, backup_path)
+
+        # 步骤2：用出厂菜单覆盖当前菜单
+        shutil.copy2(factory_file, config.menu_file)
+
+        # 步骤3：[BUG FIX] 清除缓存后热重载
+        import database
+        database.load_menu.cache_clear()
+        database.load_menu()
+
+        # 返回新菜单内容，前端可用此内容同步更新编辑器界面
+        with open(config.menu_file, "r", encoding="utf-8") as f:
+            return {"status": "success", "content": f.read()}
+
+    except Exception as e:
+        logger.error(f"Factory Reset 失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 配送区域管理 API ---
+
+@app.get("/api/admin/delivery_areas")
+async def get_delivery_areas():
+    """
+    读取配送区域文本文件内容，供前端文本编辑器使用。
+
+    Returns:
+        dict: {"content": "<Delivery Area.txt 的文本内容>"}
+              文件不存在时返回 {"content": ""}
+    """
+    if os.path.exists(config.delivery_areas_file):
+        with open(config.delivery_areas_file, "r", encoding="utf-8") as f:
+            return {"content": f.read()}
+    return {"content": ""}
+
+
+@app.post("/api/admin/delivery_areas")
+async def save_delivery_areas(payload: dict):
+    """
+    保存配送区域文本并清除对应的内存缓存。
+
+    配送区域文本格式（Delivery Area.txt）：
+        Drogheda ........ €3
+        Drogheda Rural .. €5
+        Dunleer ......... €5.50
+
+    操作完成后清除 load_delivery_areas 的 lru_cache，
+    确保下次查询时读取最新的配送区域数据。
+
+    Args:
+        payload (dict): 请求体，包含 "content" 字段（文本内容）
+
+    Returns:
+        dict: {"status": "success"}
+    """
+    try:
+        content = payload.get("content", "")
+        with open(config.delivery_areas_file, "w", encoding="utf-8") as f:
+            f.write(content)
+        # [BUG FIX] 清除配送区域缓存，确保新数据立即生效
+        import database
+        database.load_delivery_areas.cache_clear()
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- 代码文件管理 API ---
+# 允许通过管理面板在线查看和编辑关键 Python 文件
+
+# 白名单：只允许访问这些文件，防止任意文件读取安全漏洞
+ALLOWED_CODE_FILES = [
+    "prompts.py", "tools_address.py", "tools_history.py",
+    "tools_manage_call.py", "tools_pricing.py", "server.py",
+    "config.py", "database.py"
+]
+
+
+@app.get("/api/admin/code")
+async def get_code(file: str):
+    """
+    读取指定 Python 文件的内容，供前端代码编辑器使用。
+
+    安全控制：只允许访问 ALLOWED_CODE_FILES 白名单中的文件。
+
+    Args:
+        file (str): 文件名（Query 参数，如 ?file=prompts.py）
+
+    Returns:
+        dict: {"content": "<文件内容字符串>"}
+
+    Raises:
+        403: 文件不在白名单中
+        404: 文件不存在
+    """
+    if file not in ALLOWED_CODE_FILES:
+        raise HTTPException(status_code=403, detail="File access not allowed")
+
+    if os.path.exists(file):
+        with open(file, "r", encoding="utf-8") as f:
+            return {"content": f.read()}
+    raise HTTPException(status_code=404, detail="File not found")
+
+
+class CodeUpdate(BaseModel):
+    """POST /api/admin/code 的请求体模型"""
+    content: str  # 修改后的文件内容
+    file: str     # 目标文件名
+
+
+@app.post("/api/admin/code")
+async def save_code(payload: CodeUpdate, role: str = Depends(verify_admin)):
+    """
+    保存修改后的 Python 文件（含自动备份）。
+
+    注意：
+        保存代码文件后通常需要重启服务才能使更改生效（Python 不支持热重载模块）。
+        唯一例外是 prompts.py，因为每次通话都会调用 get_system_instruction()，
+        所以提示词修改立即生效。
+
+    操作流程：
+        1. 验证文件在白名单中
+        2. 备份原文件到 backups/ 目录
+        3. 写入新内容
+
+    Returns:
+        dict: {"status": "success", "message": "..."}
+
+    Raises:
+        403: 文件不在白名单中
+        500: 文件操作失败
+    """
+    if payload.file not in ALLOWED_CODE_FILES:
+        raise HTTPException(status_code=403, detail="File modification not allowed")
+
+    try:
+        backup_path = None
+        # 备份原文件
+        if os.path.exists(payload.file):
+            backup_dir = "backups"
+            os.makedirs(backup_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(backup_dir, f"{payload.file}.{timestamp}.bak")
+            import shutil
+            shutil.copy2(payload.file, backup_path)
+
+        # 写入新内容
+        with open(payload.file, "w", encoding="utf-8") as f:
+            f.write(payload.content)
+
+        msg = f"Saved and backed up to {backup_path}" if backup_path else "Saved"
+        return {"status": "success", "message": msg}
+
+    except Exception as e:
+        logger.error(f"保存代码失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/backups")
+async def list_backups(file: str, role: str = Depends(verify_admin)):
+    """
+    列出指定文件的所有历史备份（按时间倒序）。
+
+    Args:
+        file (str): 原始文件名（如 "prompts.py"）
+
+    Returns:
+        list: 备份信息列表，每项包含：
+              {"filename": str, "timestamp": str, "path": str}
+              若无备份则返回空列表
+    """
+    backup_dir = "backups"
+    if not os.path.exists(backup_dir):
+        return []
+
+    backups = []
+    for f in os.listdir(backup_dir):
+        if f.startswith(f"{file}."):
+            parts = f.split('.')
+            if len(parts) >= 3:
+                ts_str = parts[-2]  # 时间戳部分（格式：YYYYMMDD_HHMMSS）
+                backups.append({
+                    "filename": f,
+                    "timestamp": ts_str,
+                    "path": os.path.join(backup_dir, f)
+                })
+
+    # 按时间戳字符串倒序排列（最新的备份排在最前面）
+    backups.sort(key=lambda x: x["timestamp"], reverse=True)
+    return backups
+
+
+class RestoreUpdate(BaseModel):
+    """POST /api/admin/restore 的请求体模型"""
+    backup_filename: str  # 备份文件名（如 "prompts.py.20251227_163445.bak"）
+    target_file: str      # 恢复到的目标文件名（如 "prompts.py"）
+
+
+@app.post("/api/admin/restore")
+async def restore_backup(payload: RestoreUpdate, role: str = Depends(verify_admin)):
+    """
+    从指定备份文件恢复代码，覆盖当前版本。
+
+    注意：
+        恢复操作不会再次备份当前版本，请谨慎使用。
+        建议恢复前先通过 GET /api/admin/code 保存当前内容。
+
+    Returns:
+        dict: {"status": "success"}
+
+    Raises:
+        404: 备份文件不存在
+        500: 文件操作失败
+    """
+    backup_path = os.path.join("backups", payload.backup_filename)
+    if not os.path.exists(backup_path):
+        raise HTTPException(status_code=404, detail="Backup not found")
+
+    try:
+        import shutil
+        shutil.copy2(backup_path, payload.target_file)
+        return {"status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/admin/stats")
+async def get_dashboard_stats(role: str = Depends(get_current_role)):
+    """
+    提供管理面板（Dashboard）统计图表所需的数据。
+    包含：
+        1. 营业额趋势 (最近7个营业日)
+        2. 订单数量趋势 (最近7个营业日)
+        3. 热销菜品 Top 5 (按销量)
+        4. 总体统计 (总订单，总营业额，总客户)
+    """
+    try:
+        from database import get_db_session
+        from models import Order, Customer
+        from sqlalchemy import func
+        
+        with get_db_session() as db:
+            # 1. 总体统计
+            total_orders = db.query(Order).filter(~Order.source.like('%Incomplete%')).count()
+            total_revenue = db.query(func.sum(Order.total_value)).filter(~Order.source.like('%Incomplete%')).scalar() or 0.0
+            total_customers = db.query(Customer).count()
+            
+            # --- 构建最近 7 个业务日期的标签列表 ---
+            # 简化实现，这里通过取数据库中最后有的独特的 7 个日期来实现，或者根据当前时间往前推 7 天
+            recent_dates = [get_business_date_str((datetime.now() - timedelta(days=i)).timestamp()) for i in range(6, -1, -1)]
+            
+            # 2. & 3. 营业额和订单趋势
+            # 查询匹配这 7 天的记录
+            orders_in_range = db.query(Order).filter(
+                Order.business_date.in_(recent_dates),
+                ~Order.source.like('%Incomplete%')
+            ).all()
+
+            revenue_by_date = {d: 0.0 for d in recent_dates}
+            orders_by_date = {d: 0 for d in recent_dates}
+            
+            # 4. 热销菜品
+            item_sales = {}
+            
+            for o in orders_in_range:
+                d = o.business_date
+                if d in revenue_by_date:
+                    revenue_by_date[d] += float(o.total_value)
+                    orders_by_date[d] += 1
+                
+                # 统计 item 销量
+                if isinstance(o.items, list):
+                    for item in o.items:
+                        name = item.get("name")
+                        if name:
+                            item_sales[name] = item_sales.get(name, 0) + 1
+            
+            # Formatting arrays for recharts UI
+            trend_data = []
+            for date_str in recent_dates:
+                 trend_data.append({
+                     "date": date_str,
+                     "revenue": round(revenue_by_date[date_str], 2),
+                     "orders": orders_by_date[date_str]
+                 })
+            
+            top_items = sorted([{"name": k, "value": v} for k, v in item_sales.items()], key=lambda x: x["value"], reverse=True)[:5]
+            
+            return {
+                "summary": {
+                    "total_orders": total_orders,
+                    "total_revenue": round(total_revenue, 2),
+                    "total_customers": total_customers
+                },
+                "trend": trend_data,
+                "top_items": top_items
+            }
+
+    except Exception as e:
+        logger.error(f"获取统计数据失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== 执行启动后业务逻辑 =====
+# 验证 SQLite 数据库是否可用
+if not database.init_db():
+    logger.warning("数据库初始化失败或不存在，系统可能无法正常工作。")
+else:
+    logger.info("✅ 数据库系统就绪")
+    
+try:
+    # 在此处预加载打字音效掩盖延迟
+    audio_injector.load_typing_audio("键盘.wav")
+except Exception as e:
+    logger.error(f"打字音效加载失败，延迟掩盖将不可用: {e}")
+
+
+# =============================================================================
+# 订单列表获取 API
+# =============================================================================
+@app.get("/api/admin/orders")
+async def get_orders_list(all: str = "false", role: str = Depends(get_current_role)):
+    """
+    获取管理面板查看的历史与今日订单列表，包括草稿单和已完成订单。
+    规则：把 Source 包含 'Incomplete' 字段的订单永远置顶，并且按倒序时间排列。
+    若 `all=true`，则直接按倒序返回所有历史订单。
+    """
+    try:
+        from database import get_db_session, load_menu
+        from models import Order
+        import json
+        
+        with get_db_session() as db:
+            # Query all orders
+            all_orders = db.query(Order).order_by(Order.created_at.desc()).all()
+            
+            menu_data = load_menu()
+            price_map = {}
+            option_price_map = {}
+            for cat, c_items in menu_data.items():
+                if isinstance(c_items, list):
+                    for mi in c_items:
+                        price_map[mi['name'].strip().lower()] = float(mi.get('price', 0.0))
+                        if mi.get('options'):
+                            for opt in mi['options']:
+                                for val in opt.get('values', []):
+                                    option_price_map[val['name'].strip().lower()] = float(val.get('price_mod', 0.0))
+            
+            # format the query into dictionaries
+            formatted_orders = []
+            for o in all_orders:
+                items_list = o.items or []
+                if isinstance(items_list, str):
+                    try: items_list = json.loads(items_list)
+                    except: items_list = []
+                
+                enriched_items = []
+                for it in items_list:
+                    if not isinstance(it, dict):
+                        enriched_items.append(it)
+                        continue
+                    
+                    item_name_lower = str(it.get('name', '')).strip().lower()
+                    
+                    # 1. 查找对应的菜品 db_item (优先完全相等，其次模糊)
+                    db_item = None
+                    for cat, c_items in menu_data.items():
+                        if isinstance(c_items, list):
+                            for mi in c_items:
+                                if mi['name'].strip().lower() == item_name_lower:
+                                    db_item = mi
+                                    break
+                            if db_item: break
+                    
+                    if not db_item:
+                        for cat, c_items in menu_data.items():
+                            if isinstance(c_items, list):
+                                for mi in c_items:
+                                    if item_name_lower in mi['name'].strip().lower() or mi['name'].strip().lower() in item_name_lower:
+                                        db_item = mi
+                                        break
+                                if db_item: break
+
+                    base_p = float(db_item.get('price', 0.0)) if db_item else 0.0
+                    
+                    # 2. 从 db_item['options'] 中精准查找用户的选项
+                    opts = it.get('options', [])
+                    modified_opts = []
+                    
+                    for opt_v in opts:
+                        opt_name = opt_v if isinstance(opt_v, str) else str(opt_v.get('name', ''))
+                        opt_name_lower = opt_name.strip().lower()
+                        mod = 0.0
+                        found_mod = False
+
+                        if db_item and 'options' in db_item:
+                            # 第一步：尝试精确匹配 (Exact Match)
+                            for menu_opt_cat in db_item['options']:
+                                for val in menu_opt_cat['values']:
+                                    if opt_name_lower == val['name'].strip().lower():
+                                        mod = float(val.get('price_mod', 0.0))
+                                        found_mod = True
+                                        break
+                                if found_mod: break
+                            
+                            # 第二步：如果精确匹配失败，尝试模糊匹配 (Substring)
+                            if not found_mod:
+                                for menu_opt_cat in db_item['options']:
+                                    for val in menu_opt_cat['values']:
+                                        if opt_name_lower in val['name'].strip().lower():
+                                            mod = float(val.get('price_mod', 0.0))
+                                            found_mod = True
+                                            break
+                                    if found_mod: break
+                        
+                        base_p += mod
+                        if isinstance(opt_v, dict):
+                            if 'price_adjustment' not in opt_v:
+                                opt_v['price_adjustment'] = mod
+                            modified_opts.append(opt_v)
+                        else:
+                            modified_opts.append({"name": opt_name, "price_adjustment": mod})
+                            
+                    it['unit_price'] = base_p
+                    it['options'] = modified_opts
+                    enriched_items.append(it)
+
+                order_dict = {
+                    "id": o.id,
+                    "business_date": o.business_date,
+                    "created_at": o.created_at.isoformat(),
+                    "customer_phone": o.customer_phone,
+                    "customer_name": o.customer.name if o.customer else "Unknown",
+                    "address": o.customer.address if o.customer else "Unknown",
+                    "source": o.source,
+                    "service_type": o.service_type,
+                    "delivery_area": o.delivery_area,
+                    "delivery_fee": float(o.delivery_fee) if o.delivery_fee else 0.0,
+                    "payment_method": o.payment_method,
+                    "total_value": float(o.total_value) if o.total_value else 0.0,
+                    "notes": o.notes,
+                    "items": enriched_items,
+                    "transcript": o.transcript
+                }
+                formatted_orders.append(order_dict)
+
+            if all.lower() == "true":
+                return {"status": "success", "orders": formatted_orders}
+
+            incomplete_orders = []
+            completed_orders = []
+            today_str = get_business_date_str()
+            
+            for o in formatted_orders:
+                if "Incomplete" in o["source"]:
+                    incomplete_orders.append(o)
+                elif o["business_date"] == today_str:
+                    completed_orders.append(o)
+            
+            # Combine them: Incomplete always go first.
+            result = incomplete_orders + completed_orders
+            
+            return {"status": "success", "orders": result}
+
+    except Exception as e:
+        logger.error(f"获取订单列表失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =============================================================================
+# 客户列表获取 API
+# =============================================================================
+@app.get("/api/admin/customers")
+async def get_customers_list():
+    """
+    获取所有客户的信息列表
+    """
+    try:
+        from database import get_db_session
+        from models import Customer
+        
+        with get_db_session() as db:
+            customers = db.query(Customer).order_by(Customer.id.desc()).all()
+            
+            result = []
+            for c in customers:
+                result.append({
+                    "id": c.id,
+                    "phone_number": c.phone_number,
+                    "name": c.name or "Unknown",
+                    "address": c.address or "Unknown",
+                    "last_order_id": c.last_order_id or "None"
+                })
+            
+            return {"status": "success", "customers": result}
+
+    except Exception as e:
+        logger.error(f"获取客户列表失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/orders/{order_id}")
+async def delete_order(order_id: str):
+    """
+    删除指定的订单 (历史或草稿)
+    """
+    try:
+        from database import get_db_session
+        from models import Order
+        
+        with get_db_session() as db:
+            order = db.query(Order).filter(Order.id == order_id).first()
+            if not order:
+                raise HTTPException(status_code=404, detail="Order not found")
+            
+            db.delete(order)
+            db.commit()
+            return {"status": "success", "message": f"Order {order_id} gracefully deleted."}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"删除订单失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/admin/logs")
+async def clear_logs():
+    """
+    清空后台日志文件.
+    """
+    try:
+        # 打开 server.log 并清空内容
+        with open("server.log", "w", encoding="utf-8") as f:
+            f.truncate(0)
+        return {"status": "success", "message": "Server logs have been cleared."}
+    except Exception as e:
+        logger.error(f"Failed to clear logs: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =============================================================================
+# 管理端 API：电话排队区手动转接 (Emergency Transfer)
+# =============================================================================
+
+from pydantic import BaseModel
+
+class TransferQueueRequest(BaseModel):
+    call_sid: str
+
+@app.post("/api/admin/queue/transfer")
+async def transfer_queued_call(
+    request: TransferQueueRequest,
+    background_tasks: BackgroundTasks,
+    role: str = Depends(verify_admin)
+):
+    """
+    一键将正在排队区听等待音乐的客户强行转接到人工。
+    原理：使用 Twilio REST API 对正在执行的 Call 覆盖新的 TwiML 指令（挂断并拨号至客服）。
+    注意：此接口要求高级管理员权限（admin role），普通接线员（staff）无权使用。
+    """
+    # verify_admin 已经在拦截器层面确保了只有 admin 能通过
+
+    global waiting_calls
+    call_sid = request.call_sid
+    
+    # 2. 在排队缓存中寻找目标
+    target_call = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
+    if not target_call:
+        raise HTTPException(status_code=404, detail="Call not found in wait queue")
+        
+    account_sid = target_call.get("account_sid")
+    if not account_sid or account_sid == "Unknown":
+        raise HTTPException(status_code=400, detail="Missing AccountSid for this call")
+
+    # 优先使用 config 里的显式变量，若未填则 fallback 使用传入的 account_sid
+    # 以及 config中的 auth token 密码
+    auth_account_sid = config.twilio_account_sid or account_sid
+    auth_token = config.twilio_auth_token
+    
+    if not auth_token:
+        raise HTTPException(status_code=500, detail="TWILIO_AUTH_TOKEN is missing in environment. Cannot perform REST API requests.")
+        
+    # 覆盖 TwiML，立刻中断 Enqueue 逻辑并转接给人工
+    transfer_twiml = f'''<Response><Say voice="Polly.Amy">Transferring to human agent. Please hold.</Say><Dial>{config.transfer_phone_number}</Dial></Response>'''
+
+    # 3. 使用 httpx 发送 Twilio REST POST 更新 Call 操作
+    # API: https://api.twilio.com/2010-04-01/Accounts/{AccountSid}/Calls/{CallSid}.json
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account_sid}/Calls/{call_sid}.json"
+    data = {"Twiml": transfer_twiml}
+    
+    try:
+        import httpx
+        # Twilio API 要求 HTTP 基本认证：用户名=AccountSid, 密码=AuthToken
+        auth = (auth_account_sid, auth_token)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, data=data, auth=auth, timeout=5.0)
+            
+        if response.status_code >= 400:
+            logger.error(f"Failed to transfer wait queue call via REST API: {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=f"Twilio API Error: {response.text}")
+            
+        logger.info(f"Successfully transferred call {call_sid} from queue to human agent.")
+        
+        # 4. 从内存队列中将其抹除
+        waiting_calls = [c for c in waiting_calls if c["call_sid"] != call_sid]
+        # 5. 立刻广播更新给所有前端仪表盘
+        background_tasks.add_task(broadcast_admin, "queue_update", waiting_calls)
+        
+        return {"status": "success", "message": "Call transferred to human"}
+
+    except Exception as e:
+        logger.error(f"Error executing transfer REST request: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# 核心业务路由：Twilio 电话接入
+# =============================================================================
+
+@app.post("/incoming-call")
+async def incoming_call(request: Request):
+    """
+    Twilio 电话呼入入口（Webhook）。
+
+    当有新电话拨入 Twilio 号码时，Twilio 会向此端点发送 HTTP POST 请求，
+    本函数返回 TwiML（Twilio Markup Language）XML 指令，告知 Twilio 如何处理通话。
+
+    路由判断逻辑（按优先级）：
+        1. master_switch = "offline"
+           → 播放离线消息后挂断（或直接拒接，取决于 offline_message 是否为空）
+        2. master_switch = "bypass"
+           → 播放绕过消息后直接转接人工
+        3. 并发数 >= max_concurrent_calls
+           → 根据 call_overflow_action 转接人工或播放繁忙消息后挂断
+        4. 正常情况（master_switch = "active"）
+           → 建立 WebSocket 媒体流，开始 AI 接待
+
+    每次来电都会重新加载配置（config.reload_settings()），
+    确保通过管理面板修改的设置立即生效。
+
+    Args:
+        request (Request): FastAPI 请求对象，包含来电号码（Form 参数）
+
+    Returns:
+        Response: 内容为 TwiML XML 字符串，Content-Type 为 "application/xml"
+    """
+    # 每次来电重新加载配置，确保管理面板的修改立即生效
+    config.reload_settings()
+
+    # 获取服务器 Host（用于构建 WebSocket WSS 地址）
+    host = request.headers.get("host")
+    if not host:
+        host = "localhost:5000"  # 本地调试时的后备值
+
+    # 提取来电号码和账户 SID（Twilio 在 Form 数据中提供）
+    form_data = await request.form()
+    caller_number = form_data.get("From", "Unknown")
+    call_sid = form_data.get("CallSid", "Unknown")
+    account_sid = form_data.get("AccountSid", "Unknown")
+    logger.info(f"来电号码: {caller_number}, AccountSid: {account_sid}")
+
+    # --- 路由判断 1：离线模式 ---
+    if config.master_switch == "offline":
+        logger.info(f"状态 [Offline]: 处理来电 {caller_number}")
+        if not config.offline_message or config.offline_message.strip() == "":
+            # 离线消息为空：直接拒接，不播放任何声音
+            twiml = "<Response><Reject /></Response>"
+        else:
+            # 使用 Amazon Polly TTS 播放离线消息后挂断
+            twiml = f"""
+            <Response>
+                <Say voice="Polly.Amy">{config.offline_message}</Say>
+                <Hangup/>
+            </Response>
+            """
+        return Response(content=twiml, media_type="application/xml")
+
+    # --- 路由判断 2：旁路模式（直接转人工）---
+    elif config.master_switch == "bypass":
+        logger.info(f"状态 [Bypass]: 转接人工 {caller_number}")
+        twiml = f"""
+        <Response>
+            <Say voice="Polly.Amy">{config.bypass_message}</Say>
+            <Dial>{config.transfer_phone_number}</Dial>
+        </Response>
+        """
+        return Response(content=twiml, media_type="application/xml")
+
+    # --- 路由判断 3：并发数超限 ---
+    if len(ACTIVE_CALLS) >= config.max_concurrent_calls:
+        logger.warning(
+            f"达到最大并发数 ({config.max_concurrent_calls})！"
+            f"触发溢出处理: {config.call_overflow_action}"
+        )
+        if config.call_overflow_action == "transfer":
+            # 溢出策略：转接人工
+            twiml = f"""
+            <Response>
+                <Say voice="Polly.Amy">Our AI agents are currently busy. Please hold on while we transfer you to a human.</Say>
+                <Dial>{config.transfer_phone_number}</Dial>
+            </Response>
+            """
+        else:
+            # 溢出策略：拒绝（播放繁忙提示后挂断）
+            twiml = f"""
+            <Response>
+                <Say voice="Polly.Amy">We are currently experiencing high call volumes. Please try calling back later. Thank you.</Say>
+                <Hangup/>
+            </Response>
+            """
+        return Response(content=twiml, media_type="application/xml")
+
+    # --- 路由判断 4：并发排队控制 (Wait Queue) ---
+    global global_ai_busy, waiting_calls
+    # 如果系统恰逢真在通话（无论是电话还是WebRTC）中，将其放入排队机制
+    if global_ai_busy:
+        logger.info(f"状态 [Queue]: 系统忙碌，号码 {caller_number} 进入排队等待。")
+        wait_msg = config.wait_message or "All lines are currently busy, please hold on."
+        wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
+        
+        twiml = f"""
+        <Response>
+            <Say voice="Polly.Amy">{wait_msg}</Say>
+            <Enqueue waitUrl="{wait_music}">WaitQueue_AI</Enqueue>
+        </Response>
+        """
+        # 将其信息登入缓存队列并广播
+        waiting_calls.append({
+            "call_sid": call_sid,
+            "account_sid": account_sid,
+            "number": caller_number,
+            "joined_at": time.time()
+        })
+        background_tasks.add_task(broadcast_admin, "queue_update", waiting_calls)
+        return Response(content=twiml, media_type="application/xml")
+
+    # --- 路由判断 5：正常接待（active 模式）---
+    # 如果不忙，那就上锁，准备接通！
+    global_ai_busy = True
+    background_tasks.add_task(broadcast_admin, "ai_status", {"busy": True})
+
+    # <Connect><Stream> 是核心指令，指示 Twilio 建立 WebSocket 媒体流
+    # url 必须是 wss:// 协议（Twilio 要求 TLS 加密），因此需要 ngrok 提供 HTTPS 隧道
+    # <Parameter> 将来电号码作为自定义参数传递给流处理器
+    # <Redirect> 在 WebSocket 关闭后执行，用于处理挂断/转接后续逻辑
+    twiml = f"""
+    <Response>
+        <Connect>
+            <Stream url="wss://{host}/media-stream">
+                <Parameter name="customer_number" value="{caller_number}" />
+            </Stream>
+        </Connect>
+        <!-- WebSocket 关闭后，Twilio 重定向到此路由继续执行 TwiML -->
+        <Redirect method="POST">https://{host}/stream-ended</Redirect>
+    </Response>
+    """
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/stream-ended")
+async def stream_ended(request: Request):
+    """
+    WebSocket 媒体流结束后的通话后续处理。
+
+    当 /media-stream WebSocket 关闭后，Twilio 会调用 incoming-call TwiML 中的
+    <Redirect> 指令，跳转到此路由。
+
+    此路由根据 CALL_STATES 字典中记录的意图决定最终动作：
+        - intent = "hangup"   → 执行 <Hangup> 正常挂断
+        - intent = "transfer" → 执行 <Dial> 转接到人工号码
+
+    兼容性说明：
+        state 可能是旧格式（字符串）或新格式（字典），
+        代码同时支持两种格式以保证向后兼容。
+
+    Args:
+        request (Request): Twilio 的 POST 请求，包含 CallSid 等参数
+
+    Returns:
+        Response: TwiML XML（Hangup 或 Dial）
+    """
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid")
+    logger.info(f"通话流结束，CallSid: {call_sid}")
+
+    # 强制重新加载配置，确保读取到最新的 transfer_phone_number 等设置
+    config.reload_settings()
+
+    # 获取状态，兼容旧版字符串格式和新版字典格式
+    state = CALL_STATES.get(call_sid, {"intent": "hangup", "reason": "Unknown"})
+    if isinstance(state, str):
+        # 旧格式（已废弃）：状态直接是字符串
+        intent = state
+        reason = "Unknown"
+    else:
+        # 新格式：字典，包含 intent 和 reason
+        intent = state.get("intent", "hangup")
+        reason = state.get("reason", "Unknown")
+
+    # 清除已处理的状态，防止内存泄漏
+    if call_sid in CALL_STATES:
+        del CALL_STATES[call_sid]
+
+    if intent == "transfer":
+        logger.info(f"执行转接，原因: {reason}")
+        if reason == "system_fallback":
+            message = "I'm having trouble connecting to my brain right now. Please hold on while I transfer you to a human."
+        else:
+            message = "Transferring you now. Please hold."
+        twiml = f"""
+        <Response>
+            <Say voice="Polly.Amy">{message}</Say>
+            <Dial>{config.transfer_phone_number}</Dial>
+        </Response>
+        """
+    else:
+        # 默认：正常挂断
+        twiml = """
+        <Response>
+            <Hangup/>
+        </Response>
+        """
+
+    return Response(content=twiml, media_type="application/xml")
+
+
+# =============================================================================
+# 核心业务路由：Twilio ↔ Gemini 音频桥接
+# =============================================================================
+
+@app.websocket("/media-stream")
+async def handle_media_stream(websocket: WebSocket):
+    """
+    Twilio 媒体流 WebSocket 处理器，是整个系统的核心。
+
+    功能：
+        双向实时桥接 Twilio（电话端）和 Google Gemini Live API（AI 端），
+        实现"AI 接电话"的核心功能。
+
+    音频处理流程：
+        ┌─────────────────────────────────────────────────┐
+        │ 方向 1 (Twilio → Gemini)：                        │
+        │   mu-law 8k → PCM 16-bit 8k → PCM 16-bit 16k    │
+        │   （上采样：每个样本重复一次）                      │
+        │                                                   │
+        │ 方向 2 (Gemini → Twilio)：                        │
+        │   PCM 16-bit 24k → PCM 16-bit 8k → mu-law 8k    │
+        │   （下采样：每 3 个字节取第 1 个，即 24k→8k）       │
+        └─────────────────────────────────────────────────┘
+
+    并发架构：
+        两个独立的异步任务并发运行：
+            任务 A (receive_from_twilio)：Twilio → Gemini 方向
+            任务 B (receive_from_gemini)：Gemini → Twilio 方向 + 工具调用
+
+        使用 asyncio.wait(return_when=FIRST_COMPLETED) 等待，
+        任何一个任务结束（正常或异常），另一个任务立即被取消。
+
+    工具调用处理（在任务 B 中）：
+        Gemini 可能在响应中包含 toolCall 字段，表示需要调用某个函数。
+        支持的工具：
+            - search_address：调用 AutoAddress API 验证地址
+            - calculate_total：计算订单总价
+            - end_call：挂断并归档订单
+            - transfer_call：转接人工
+            - get_past_order：查询历史订单
+
+    注意：
+        此函数为 WebSocket 端点，不直接被 HTTP 路由调用。
+        Twilio 在建立媒体流时会自动连接此 WebSocket。
+    """
+    await websocket.accept()
+    logger.info("Twilio WebSocket 连接已建立")
+    await broadcast_admin("system_log", {
+        "message": "Twilio WebSocket 握手成功，等待来电...",
+        "type": "info"
+    })
+
+    # 建立与 Google Gemini Live API 的 WebSocket 连接
+    # gemini_ws_uri 包含 API Key，在 config.gemini_ws_uri 属性中动态生成
+    async with ws_connect(
+        config.gemini_ws_uri,
+        extra_headers={"Content-Type": "application/json"}
+    ) as gemini_ws:
+
+        await broadcast_admin("system_log", {
+            "message": "已连接至 Google Gemini V2 Live API。",
+            "type": "success"
+        })
+
+        # --- 共享状态变量（在两个子任务间共享）---
+        stream_sid = None        # Twilio 媒体流 SID（发送音频时必须携带）
+        stream_call_sid = None   # Twilio 通话 SID（用于 CALL_STATES 和 ACTIVE_CALLS）
+        customer_number = "Unknown"   # 来电号码
+        customer_info = None     # 客户档案字典（从数据库查询，可能为 None）
+        call_transcript = []     # 记录该通电话的对话记录
+
+        # 草稿订单缓存：在 calculate_total 调用后立即填充
+        # 若通话在 end_call 前意外断开，此草稿会被自动保存为"未完成"订单
+        draft_order = {}
+        order_finalized = False  # 标记 end_call 是否已成功执行（避免重复保存）
+
+        # -----------------------------------------------------------------------
+        # 内部任务 A：Twilio → Gemini（接收用户语音，转发给 AI）
+        # -----------------------------------------------------------------------
+        async def receive_from_twilio():
+            """
+            持续接收 Twilio 发来的 WebSocket 消息，处理三种事件：
+                1. media：音频数据包（mu-law 8k）
+                   → 解码为 PCM 16bit 8k → 上采样到 16k → 发送给 Gemini
+                2. start：通话开始事件
+                   → 提取 stream_sid、call_sid、来电号码
+                   → 查询客户档案
+                   → 发送 Gemini 初始化 Setup 消息
+                   → 发送触发器让 AI 先开口打招呼
+                3. stop：通话停止事件
+                   → 退出循环，结束任务
+            """
+            nonlocal stream_sid, stream_call_sid, customer_number, customer_info
+
+            try:
+                while True:
+                    message = await websocket.receive_text()
+                    data = json.loads(message)
+
+                    # --- 事件 1：音频数据包 ---
+                    if data['event'] == 'media':
+                        media_payload = data['media']['payload']
+                        # 步骤1：Base64 解码得到 mu-law 编码的原始字节
+                        mulaw_data = base64.b64decode(media_payload)
+
+                        # 步骤2：mu-law → PCM 16-bit（8kHz）
+                        # audioop.ulaw2lin(data, width) 中 width=2 表示 16-bit 采样
+                        pcm_8k = audioop.ulaw2lin(mulaw_data, 2)
+
+                        # 步骤3：PCM 8kHz → PCM 16kHz（Gemini 要求最低 16kHz）
+                        # 方法：简单重复（每个 2 字节样本写两次）
+                        # 这是最低成本的上采样方法，会产生轻微的阶梯状失真，
+                        # 但对语音识别来说已足够准确
+                        pcm_16k_chunks = []
+                        for i in range(0, len(pcm_8k), 2):
+                            sample = pcm_8k[i:i+2]
+                            pcm_16k_chunks.append(sample)
+                            pcm_16k_chunks.append(sample)  # 重复一次实现 2× 上采样
+                        pcm_16k = b"".join(pcm_16k_chunks)
+
+                        # 步骤4：发送给 Gemini（Base64 编码的 PCM 音频）
+                        await gemini_ws.send(json.dumps({
+                            "realtimeInput": {
+                                "audio": {
+                                    "data": base64.b64encode(pcm_16k).decode('utf-8'),
+                                    "mimeType": f"audio/pcm;rate={config.gemini_input_sample_rate}"
+                                }
+                            }
+                        }))
+
+                    # --- 事件 2：通话开始 ---
+                    elif data['event'] == 'start':
+                        stream_sid = data['start']['streamSid']
+                        stream_call_sid = data['start']['callSid']
+                        # 从 incoming-call 路由通过 TwiML <Parameter> 传递的来电号码
+                        custom_params = data['start'].get('customParameters', {})
+                        customer_number = custom_params.get('customer_number', 'Unknown')
+                        logger.info(
+                            f"通话开始，Stream SID: {stream_sid}, "
+                            f"Customer Number: {customer_number}"
+                        )
+
+                        # 查询客户档案（返回 None 表示新客户）
+                        customer_info = database.get_customer(customer_number)
+                        caller_name = (
+                            customer_info.get('name', 'Unknown Caller')
+                            if customer_info else 'Unknown Caller'
+                        )
+
+                        # 记录到活跃通话字典，用于并发控制和管理面板展示
+                        ACTIVE_CALLS[stream_call_sid] = {
+                            "start_time": time.time(),
+                            "caller_number": customer_number,
+                            "caller_name": caller_name
+                        }
+                        # 广播给管理面板
+                        await broadcast_admin("call_start", {
+                            "call_sid": stream_call_sid,
+                            "caller": customer_number,
+                            "caller_name": caller_name,
+                            "active_count": len(ACTIVE_CALLS),
+                            "active_calls": ACTIVE_CALLS
+                        })
+
+                        # 加载菜单和餐厅信息（用于构建 AI System Prompt）
+                        menu_text = database.get_menu_text()
+                        restaurant_info = database.get_restaurant_info()
+
+                        # 发送 Gemini Setup 消息（定义 AI 人设、工具列表、语音配置）
+                        await send_setup_message(
+                            gemini_ws, customer_info, menu_text,
+                            restaurant_info, customer_number
+                        )
+
+                        # 发送初始触发器：强制 AI 先开口打招呼
+                        # Gemini Live API 默认等待用户先说话，
+                        # 通过发送一个文本消息触发 AI 主动开口
+                        logger.info("发送初始触发器给 Gemini...")
+                        await gemini_ws.send(json.dumps({
+                            "clientContent": {
+                                "turns": [{
+                                    "role": "user",
+                                    "parts": [{"text": "Call connected. Please greet the customer."}]
+                                }],
+                                "turnComplete": True
+                            }
+                        }))
+
+                    # --- 事件 3：通话停止 ---
+                    elif data['event'] == 'stop':
+                        # Twilio 主动终止：可能是通话超时、来电方挂断、或 Twilio 服务端问题
+                        logger.warning(
+                            f"⚠️ Twilio 发送了停止信号 (call_sid={stream_call_sid})。"
+                            f"这通常意味着 Twilio 端主动结束了通话，"
+                            f"可能原因：客户挂断、Twilio 超时、或网络问题。"
+                        )
+                        await broadcast_admin("system_log", {
+                            "message": "Twilio 发送停止信号 — 通话被 Twilio 端终止",
+                            "type": "error"
+                        })
+                        return  # 退出循环，任务结束后另一个任务也会被取消
+
+            except ConnectionClosed:
+                logger.info("Twilio WebSocket 正常断开")
+                return
+            except Exception as e:
+                logger.error(f"Twilio 接收循环异常: {e}")
+                return
+
+        # -----------------------------------------------------------------------
+        # 内部任务 B：Gemini → Twilio（接收 AI 回复，转发音频给用户 + 处理工具调用）
+        # -----------------------------------------------------------------------
+        async def receive_from_gemini():
+            """
+            持续接收 Gemini 发来的 WebSocket 消息，处理四类内容：
+                1. 音频数据（modelTurn.parts[].inlineData）
+                   → 解码 PCM 24k → 下采样到 8k → 编码 mu-law → 发送给 Twilio
+                2. 实时转录（inputTranscription）
+                   → 用户的实时语音转文字，广播给管理面板字幕
+                3. AI 输出转录（outputTranscription）
+                   → AI 回复的文字版本，广播给管理面板字幕
+                4. 打断信号（interrupted）
+                   → 用户打断 AI 说话，清空 Twilio 音频缓冲队列
+                5. 工具调用（toolCall）
+                   → 分发到对应工具函数，返回结果给 Gemini
+                6. 回合结束（turnComplete）
+                   → 发送最终字幕标记，重置转录缓冲区
+            """
+            # 追踪音频播放预计完成时间（用于在挂断前等待告别语播放完毕）
+            expected_finish_time = time.time()
+            # 当前用户回合的实时转录文本（累积多个 chunk）
+            current_user_transcript = ""
+            # 声明外层共享变量（草稿订单缓存和完成标记）
+            current_ai_transcript = ""
+            nonlocal draft_order, order_finalized
+
+            typing_event = None
+            typing_task = None
+
+            def start_typing_sound():
+                nonlocal typing_event, typing_task
+                if stream_sid and (typing_event is None or typing_event.is_set()):
+                    import audio_injector
+                    typing_event = asyncio.Event()
+                    typing_task = asyncio.create_task(
+                        audio_injector.stream_audio_to_websocket(
+                            websocket, "twilio", typing_event, stream_sid
+                        )
+                    )
+
+            def stop_typing_sound():
+                nonlocal typing_event
+                if typing_event and not typing_event.is_set():
+                    typing_event.set()
+
+            try:
+                async for message in gemini_ws:
+                    response = json.loads(message)
+
+                    audio_data_parts = []  # 本次消息中的音频数据列表
+                    
+                    # 检测 Gemini 的 goAway 信号（会话即将到期的预警）
+                    if 'goAway' in response:
+                        time_left = response['goAway'].get('timeLeft', 'unknown')
+                        logger.warning(
+                            f"⚠️ Gemini 发出 goAway 信号！会话将在 {time_left} 后终止。"
+                            f"通话将被强制结束，请注意草稿订单救援。"
+                        )
+                        await broadcast_admin("system_log", {
+                            "message": f"⚠️ Gemini 会话即将超时 (剩余: {time_left})，通话可能即将断开",
+                            "type": "error"
+                        })
+
+                    if 'serverContent' in response:
+                        server_content = response['serverContent']
+
+                        # --- 提取音频数据 ---
+                        if 'modelTurn' in server_content:
+                            parts = server_content['modelTurn'].get('parts', [])
+                            for part in parts:
+                                if 'inlineData' in part:
+                                    # Base64 编码的 PCM 24kHz 音频
+                                    audio_data_parts.append(part['inlineData']['data'])
+                                    # 当 AI 开始回吐真实音频时，停止机械打字声
+                                    stop_typing_sound()
+                                if 'text' in part:
+                                    text_content = part['text']
+                                    # 当 AI 输出思维过程 (text) 时，启动机械打字声填补时间
+                                    start_typing_sound()
+                                    logger.info(f"Gemini 文本响应: {text_content}")
+                                    call_transcript.append({
+                                        "role": "thought", 
+                                        "text": f"💭 思考过程: {text_content}", 
+                                        "timestamp": time.time()
+                                    })
+                                    # 广播给管理面板
+                                    await broadcast_admin("transcript", {
+                                        "call_sid": stream_call_sid,
+                                        "role": "thought",
+                                        "text": f"💭 思考过程: {text_content}",
+                                        "is_final": True
+                                    })
+
+                        # --- 实时用户语音转录（字幕流）---
+                        if 'inputTranscription' in server_content:
+                            transcription = server_content['inputTranscription']
+                            if 'text' in transcription and transcription['text']:
+                                text_chunk = transcription['text']
+                                current_user_transcript += text_chunk  # 累积 chunk
+                                # 人类说话时，绝对不能有打字声
+                                stop_typing_sound()
+                                # 黄色输出到服务器终端（实时流式输出，不换行）
+                                print(f"\033[93m{text_chunk}\033[0m", end="", flush=True)
+                                # 广播给管理面板（实时字幕）
+                                await broadcast_admin("transcript", {
+                                    "call_sid": stream_call_sid,
+                                    "role": "user",
+                                    "text": text_chunk,
+                                    "is_final": False  # 是 chunk 而非完整句子
+                                })
+
+                        # --- AI 输出转录（AI 说了什么）---
+                        if 'outputTranscription' in server_content:
+                            text_chunk = server_content['outputTranscription'].get('text', '')
+                            if text_chunk:
+                                current_ai_transcript += text_chunk
+                                # 青色输出到服务器终端（实时流式输出，不换行）
+                                print(f"\033[96m{text_chunk}\033[0m", end="", flush=True)
+                                # 广播给管理面板（实时字幕，未完结阶段）
+                                await broadcast_admin("transcript", {
+                                    "call_sid": stream_call_sid,
+                                    "role": "ai",
+                                    "text": text_chunk,
+                                    "is_final": False # 标记为 chunk
+                                })
+
+                        # --- 处理打断信号 ---
+                        # Gemini 检测到用户在 AI 说话时开口，发送 interrupted=True
+                        if server_content.get('interrupted'):
+                            word_count = len(current_user_transcript.strip().split())
+                            logger.info(
+                                f"检测到打断信号。"
+                                f"当前转录: '{current_user_transcript}' "
+                                f"(单词数: {word_count})"
+                            )
+
+                            if word_count > 1:
+                                # 有效打断（超过 1 个单词）：清空 Twilio 端的音频缓冲队列
+                                # 这会立即停止正在播放的 AI 语音，响应用户打断
+                                logger.info("⚠️ 有效打断 (单词 > 1) → 清空播放队列")
+                                stop_typing_sound()
+                                if stream_sid:
+                                    await websocket.send_json({
+                                        "event": "clear",
+                                        "streamSid": stream_sid
+                                    })
+                                # 重置预计完成时间
+                                expected_finish_time = time.time()
+                                print("\n\033[91m[用户有效打断]\033[0m")
+
+                                # 打断时，如果 AI 刚说到一半，把 AI 已经说的半截话归档
+                                if current_ai_transcript.strip():
+                                    call_transcript.append({"role": "ai", "text": current_ai_transcript, "timestamp": time.time()})
+                                    await broadcast_admin("transcript", {
+                                        "call_sid": stream_call_sid,
+                                        "role": "ai",
+                                        "text": current_ai_transcript,
+                                        "is_final": True
+                                    })
+                                    current_ai_transcript = "" # 清空 AI 转录缓冲区
+
+                                # (不需要向 Gemini 发送 turnComplete，Gemini 在发送 interrupted 时内部已自动中止回合)
+                            else:
+                                # 短打断（≤1 个单词）：忽略，视为背景噪音或短词
+                                # 这避免了因咳嗽、喘气等噪音导致 AI 被打断的问题
+                                logger.info("ℹ️ 忽略短打断 (噪音/短词)")
+
+                            # 无论是否有效打断，都重置用户转录缓冲区
+                            current_user_transcript = ""
+
+                        # --- 回合结束信号 ---
+                        if 'turnComplete' in server_content and server_content['turnComplete']:
+                            print("")  # 换行，使下一行输出不与转录连在一起
+                            # 发送该回合用户语音的最终完整文本给管理面板
+                            if current_user_transcript:
+                                call_transcript.append({"role": "user", "text": current_user_transcript, "timestamp": time.time()})
+                                await broadcast_admin("transcript", {
+                                    "call_sid": stream_call_sid,
+                                    "role": "user",
+                                    "text": current_user_transcript,
+                                    "is_final": True  # 标记为完整句子
+                                })
+                            current_user_transcript = ""  # 重置用户转录缓冲区
+
+                            # 发送该回合 AI 语音的最终完整文本给管理面板
+                            if current_ai_transcript.strip():
+                                call_transcript.append({"role": "ai", "text": current_ai_transcript, "timestamp": time.time()})
+                                await broadcast_admin("transcript", {
+                                    "call_sid": stream_call_sid,
+                                    "role": "ai",
+                                    "text": current_ai_transcript,
+                                    "is_final": True
+                                })
+                            current_ai_transcript = "" # 清空 AI 转录缓冲区
+
+                    # --- 发送音频给 Twilio ---
+                    # 注：音频处理放在 serverContent 判断块之外，
+                    # 确保即使有工具调用等其他响应，音频也能及时发出
+                    if audio_data_parts:
+                        for audio_data_b64 in audio_data_parts:
+                            # 步骤1：Base64 解码 → PCM 16-bit 24kHz 字节
+                            pcm_24k = base64.b64decode(audio_data_b64)
+
+                            # 步骤2：PCM 24kHz → PCM 8kHz（下采样，比例 1:3）
+                            # 方法：每 6 个字节（3个 16-bit 样本）取前 2 个字节（第 1 个样本）
+                            # 即丢弃 2/3 的样本，从 24k 降到 8k
+                            try:
+                                pcm_8k_chunks = []
+                                for i in range(0, len(pcm_24k), 6):
+                                    pcm_8k_chunks.append(pcm_24k[i:i+2])
+                                pcm_8k = b"".join(pcm_8k_chunks)
+                            except Exception as e:
+                                logger.error(f"重采样错误: {e}")
+                                # 出错时使用简单的切片降采样作为后备方案
+                                pcm_8k = pcm_24k[::3]
+
+                            # 步骤3：PCM 16-bit → mu-law（Twilio 要求的格式）
+                            mulaw_data = audioop.lin2ulaw(pcm_8k, 2)
+
+                            # 步骤4：计算并更新预计音频播放完成时间
+                            # 这用于在挂断前等待足够长的时间，确保告别语播完
+                            chunk_duration = len(mulaw_data) / config.twilio_sample_rate
+                            # 如果当前时间已超过预计完成时间（缓冲区已空），
+                            # 从当前时刻重新开始计算；否则在现有队列末尾追加
+                            expected_finish_time = (
+                                max(time.time(), expected_finish_time) + chunk_duration
+                            )
+
+                            # 步骤5：发送给 Twilio 播放（streamSid 是必须的）
+                            if stream_sid:
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {
+                                        "payload": base64.b64encode(mulaw_data).decode('utf-8')
+                                    }
+                                })
+
+                    # --- 处理工具调用 ---
+                    if 'toolCall' in response:
+                        tool_call = response['toolCall']
+                        function_calls = tool_call.get('functionCalls', [])
+
+                        logger.info(f"Gemini 请求工具调用: {function_calls}")
+                        # 广播工具调用事件到管理面板（可视化调试）
+                        await broadcast_admin("tool_call", {
+                            "call_sid": stream_call_sid,
+                            "calls": function_calls
+                        })
+
+                        # --- AUDIO INJECTOR (Twilio Ticking Sound) ---
+                        # Prevent dead air over the phone while the API processes tools
+                        start_typing_sound()
+
+                        function_responses = []  # 收集所有工具的返回结果
+
+                        for call in function_calls:
+                            call_name = call['name']
+                            call_args = call.get('args', {})
+                            # ---- 工具 1：地址搜索 ----
+                            if call_name == 'search_address':
+                                query = call_args.get('address_query')
+                                t0 = time.perf_counter()
+                                result = await tools_address.search_address(query)
+                                t1 = time.perf_counter()
+                                logger.info(f"地址搜索耗时 {t1 - t0:.2f} 秒")
+
+                                function_responses.append({
+                                    "name": "search_address",
+                                    "id": call['id'],  # 必须与请求的 id 匹配
+                                    "response": {"result": result}
+                                })
+
+                            # ---- 工具 2：价格计算 ----
+                            elif call_name == 'calculate_total':
+                                logger.info(f"🔢 [里程碑] 执行 calculate_total，参数: {call_args}")
+                                
+                                result = tools_pricing.calculate_total(
+                                    call_args.get('items', []),
+                                    call_args.get('delivery_fee', 0.0),
+                                    call_args.get('payment_method', 'cash')
+                                )
+                                
+                                function_responses.append({
+                                    "name": "calculate_total",
+                                    "id": call['id'],
+                                    "response": result
+                                })
+
+                                # ★ 报价后立即缓存草稿订单
+                                # 若通话在 end_call 前意外断开，草稿会被自动保存
+                                draft_order = {
+                                    "items": call_args.get('items', []),
+                                    "delivery_fee": call_args.get('delivery_fee', 0.0),
+                                    "payment_method": call_args.get('payment_method', 'unknown'),
+                                    "calculate_total_result": result.get('result', ''),
+                                    "total": result.get('total', 0.0)
+                                }
+                                logger.info("草稿订单已缓存（报价完成）")
+                                
+                                # ★ 实时广播到前端供 POS 小票展示
+                                await broadcast_admin("live_order_update", {
+                                    "call_sid": stream_call_sid,
+                                    "items": call_args.get('items', []),
+                                    "delivery_fee": call_args.get('delivery_fee', 0.0),
+                                    "payment_method": call_args.get('payment_method', 'unknown'),
+                                    "total": result.get('total', 0.0),
+                                    "subtotal": result.get('subtotal', 0.0)
+                                })
+
+                            # ---- 工具 3：结束通话（含订单归档）----
+                            elif call_name == 'end_call':
+                                logger.info("📞 [里程碑] Gemini 请求挂断电话 (END CALL)")
+                                reason = call_args.get('reason', 'Unknown')
+
+                                # 如果有订单数据（Order 在 reason 中或传入了 items），保存订单
+                                if "Order" in reason or call_args.get('items'):
+                                    try:
+                                        # 生成唯一订单 ID（时间戳 + UUID 前4位）
+                                        order_id = f"ORD-{int(time.time())}-{str(uuid.uuid4())[:4]}"
+                                        items = call_args.get('items', [])
+                                        total = call_args.get('total_value', 0.0)
+                                        s_type = call_args.get('service_type', 'Unknown')
+                                        contact_phone = call_args.get('contact_phone')
+                                        order_note = call_args.get('order_note', '')
+
+                                        # 构建订单记录字典
+                                        order_record = {
+                                            "order_id": order_id,
+                                            "business_date_str": get_business_date_str(),
+                                            "timestamp": time.ctime(),     # 人类可读的时间戳
+                                            "customer_phone": customer_number,  # Caller ID
+                                            "contact_phone": contact_phone,     # 联系电话
+                                            "customer_name": call_args.get(
+                                                'customer_name',
+                                                customer_info.get('name') if customer_info else "Unknown"
+                                            ),
+                                            "service_type": s_type,
+                                            "address": call_args.get(
+                                                'customer_address',
+                                                customer_info.get('address') if customer_info else "Pickup"
+                                            ),
+                                            "delivery_area": call_args.get('delivery_area', 'Unknown'),
+                                            "delivery_fee": call_args.get('delivery_fee', 0.0),
+                                            "items": items,
+                                            "total_value": total,
+                                            "payment_method": call_args.get('payment_method', 'Unknown'),
+                                            "note": order_note,
+                                            "source": "AI",  # 标记为 AI 接单
+                                            "transcript": call_transcript
+                                        }
+
+                                        # 持久化保存订单到 orders.json
+                                        database.save_order(order_record)
+
+                                        # 更新客户历史档案
+                                        summary = f"{order_id}: {len(items)} items (€{total})"
+                                        database.update_customer_history(
+                                            customer_number, summary,
+                                            name=call_args.get('customer_name'),
+                                            address=call_args.get('customer_address')
+                                        )
+
+                                        logger.info(f"✅ 订单已归档: {order_id}")
+                                        order_finalized = True  # 标记正式完成，草稿不再需要
+
+                                        # 统计今日订单（含草稿）并广播给管理面板
+                                        _completed, _incomplete = get_order_counts()
+                                        await broadcast_admin("new_order", {
+                                            "total_orders": _completed,
+                                            "incomplete_orders": _incomplete,
+                                            "order_id": order_id
+                                        })
+
+                                    except Exception as e:
+                                        logger.error(f"归档订单失败: {e}")
+
+                                # 记录挂断意图（/stream-ended 路由会读取此状态）
+                                CALL_STATES[stream_call_sid] = {
+                                    "intent": "hangup",
+                                    "reason": reason
+                                }
+
+                                # 等待告别语播放完毕再挂断
+                                remaining_time = expected_finish_time - time.time()
+                                if remaining_time > 0:
+                                    # 还有待播放的音频：等待剩余时间 + 安全缓冲
+                                    wait_time = remaining_time + config.goodbye_audio_buffer_seconds
+                                    logger.info(f"即将挂断，等待告别语播放 ({wait_time:.2f}s)...")
+                                    await asyncio.sleep(wait_time)
+                                else:
+                                    # 没有待播放音频：最小延迟后挂断（防止客户听不到最后几个字）
+                                    logger.info("无待播音频，执行最小缓冲挂断...")
+                                    await asyncio.sleep(config.minimum_hangup_delay_seconds)
+
+                                # 关闭两端 WebSocket 连接，触发 Twilio 执行 <Redirect>
+                                await gemini_ws.close()
+                                await websocket.close()
+                                return  # 退出任务 B 的循环
+
+                            # ---- 工具 4：转接人工 ----
+                            elif call_name == 'transfer_call':
+                                logger.info("Gemini 请求转接电话 (TRANSFER CALL)")
+                                reason = call_args.get('reason', 'Generic Transfer')
+
+                                # 记录转接意图（/stream-ended 路由会读取此状态并生成 <Dial> TwiML）
+                                CALL_STATES[stream_call_sid] = {
+                                    "intent": "transfer",
+                                    "reason": reason
+                                }
+
+                                # 等待 AI 当前说的话播放完毕（如"正在为您转接，请稍候"）
+                                remaining_time = expected_finish_time - time.time()
+                                if remaining_time > 0:
+                                    wait_time = remaining_time + 1.0  # 1 秒安全缓冲
+                                    logger.info(f"等待 AI 说完后转接 ({wait_time:.2f}s)...")
+                                    await asyncio.sleep(wait_time)
+
+                                # 关闭连接，触发 Twilio 执行 <Redirect> → /stream-ended
+                                await gemini_ws.close()
+                                await websocket.close()
+                                return  # 退出循环
+
+                            # ---- 工具 5：查询历史订单 ----
+                            elif call_name == 'get_past_order':
+                                logger.info("Gemini 请求查询历史订单")
+                                o_id = call_args.get('order_id')
+                                result = tools_history.get_past_order(o_id)
+                                logger.info(f"历史订单查询结果: {result}")
+
+                                function_responses.append({
+                                    "name": "get_past_order",
+                                    "id": call['id'],
+                                    "response": result
+                                })
+
+                        # 将所有工具的返回结果批量发回给 Gemini
+                        if function_responses:
+                            tool_response_msg = {
+                                "toolResponse": {
+                                    "functionResponses": function_responses
+                                }
+                            }
+                            logger.info(f"发送 toolResponse: {tool_response_msg}")
+                            await gemini_ws.send(json.dumps(tool_response_msg))
+
+                            # 广播工具响应到管理面板（可视化调试）
+                            await broadcast_admin("tool_response", {
+                                "call_sid": stream_call_sid,
+                                "responses": function_responses
+                            })
+                            
+                        # --- 结束打字音效注入 ---
+                        stop_typing_sound()
+
+            except ConnectionClosed as e:
+                close_code = e.rcvd.code if e.rcvd else "unknown"
+                close_reason = e.rcvd.reason if e.rcvd else "no reason"
+
+                if close_code == 1000:
+                    logger.warning(
+                        f"⚠️ Gemini 正常关闭 (code=1000)，可能是会话时长达到上限。原因: {close_reason}"
+                    )
+                    await broadcast_admin("system_log", {
+                        "message": "Gemini 会话正常结束 (code=1000) — 可能已达会话时长上限",
+                        "type": "error"
+                    })
+                elif close_code == 1008:
+                    logger.error(
+                        f"❌ Gemini 拒绝连接 (code=1008): {close_reason}\n"
+                        f"   可能原因: ① 模型不支持某个 setup 参数（如 inputAudioTranscription）\n"
+                        f"   ② 模型名称已失效，请在设置中更换模型\n"
+                        f"   ③ API Key 配额耗尽或无权访问 Live API\n"
+                        f"   当前模型: {config.model_name}"
+                    )
+                    await broadcast_admin("system_log", {
+                        "message": (
+                            f"⛔ Gemini 拒绝连接 (1008): {close_reason} | "
+                            f"模型: {config.model_name} | "
+                            f"请检查：① 模型名是否有效 ② API Key 是否有 Live API 权限"
+                        ),
+                        "type": "error"
+                    })
+                else:
+                    logger.error(f"❌ Gemini WebSocket 异常关闭 (code={close_code}): {close_reason}")
+                    await broadcast_admin("system_log", {
+                        "message": f"Gemini 连接异常断开 code={close_code}: {close_reason}",
+                        "type": "error"
+                    })
+                    if stream_call_sid:
+                        CALL_STATES[stream_call_sid] = {"intent": "transfer", "reason": "system_fallback"}
+
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                logger.error(f"Gemini 接收循环未知异常: {e}\n{tb}")
+                await broadcast_admin("system_log", {
+                    "message": f"Gemini 流连接异常: {type(e).__name__}: {e}",
+                    "type": "error"
+                })
+                if stream_call_sid:
+                    CALL_STATES[stream_call_sid] = {"intent": "transfer", "reason": "system_fallback"}
+
+        # -----------------------------------------------------------------------
+        # 启动双向并发任务并等待
+        # -----------------------------------------------------------------------
+
+        # 创建两个异步任务（非阻塞地并发运行）
+        twilio_task = asyncio.create_task(receive_from_twilio())
+        gemini_task = asyncio.create_task(receive_from_gemini())
+
+        try:
+            # 等待任意一个任务完成（正常结束或抛出异常）
+            # FIRST_COMPLETED：只要有一个任务完成就返回，不等另一个
+            done, pending = await asyncio.wait(
+                [twilio_task, gemini_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # 取消所有仍在运行的任务（另一个方向的传输也必须停止）
+            for task in pending:
+                task.cancel()
+
+            logger.info("媒体流双向通讯结束")
+
+        except asyncio.CancelledError:
+            # 整个 WebSocket 处理函数被外部取消（如服务关闭）
+            logger.info("任务被取消（通常是因为 WebSocket 意外断开）")
+            twilio_task.cancel()
+            gemini_task.cancel()
+
+        except Exception as e:
+            logger.error(f"媒体流处理中发生意外错误: {e}")
+            twilio_task.cancel()
+            gemini_task.cancel()
+
+        finally:
+            # ★ 草稿订单救援：若通话在 end_call 前意外断开，自动保存未完成订单
+            if not order_finalized and stream_call_sid:
+                try:
+                    rescue_id = f"ORD-INCOMPLETE-{int(time.time())}-{str(uuid.uuid4())[:4]}"
+                    rescue_record = {
+                        "order_id": rescue_id,
+                        "business_date_str": get_business_date_str(),
+                        "timestamp": time.ctime(),
+                        "customer_phone": customer_number,
+                        "contact_phone": None,
+                        "customer_name": customer_info.get('name', 'Unknown') if customer_info else 'Unknown',
+                        "service_type": "Unknown (Call Dropped)",
+                        "address": customer_info.get('address', 'Unknown') if customer_info else 'Unknown',
+                        "delivery_area": "Unknown",
+                        "items": draft_order.get('items', []) if draft_order else [],
+                        "total_value": draft_order.get('total', 0.0) if draft_order else 0.0,
+                        "payment_method": draft_order.get('payment_method', 'Unknown') if draft_order else 'Unknown',
+                        "delivery_fee": draft_order.get('delivery_fee', 0.0) if draft_order else 0.0,
+                        "note": f"⚠️ 通话意外断开。报价详情: {draft_order.get('calculate_total_result', '无报价') if draft_order else '无报价'}",
+                        "source": "AI (Incomplete - Call Dropped)",
+                        "transcript": call_transcript
+                    }
+                    database.save_order(rescue_record)
+                    logger.warning(f"⚠️ 草稿订单已救援保存: {rescue_id}")
+                    _completed, _incomplete = get_order_counts()
+                    await broadcast_admin("new_order", {
+                        "total_orders": _completed,
+                        "incomplete_orders": _incomplete,
+                        "order_id": rescue_id,
+                        "warning": "通话意外断开，草稿订单已自动保存，请人工核实"
+                    })
+                except Exception as e:
+                    logger.error(f"草稿订单救援失败: {e}")
+
+            # 清理工作：无论通话如何结束，从活跃通话字典中移除并广播
+            # finally 块确保即使发生异常也能正确清理资源
+            if stream_call_sid and stream_call_sid in ACTIVE_CALLS:
+                del ACTIVE_CALLS[stream_call_sid]
+                await broadcast_admin("call_end", {
+                    "call_sid": stream_call_sid,
+                    "active_count": len(ACTIVE_CALLS),
+                    "active_calls": ACTIVE_CALLS
+                })
+            
+            # --- Wait Queue 解锁机制 ---
+            global global_ai_busy, waiting_calls
+            global_ai_busy = False # 释放 AI 接线员锁定状态
+            background_tasks.add_task(broadcast_admin, "ai_status", {"busy": False})
+            
+            # 从等待队列中移除本已经建立过实际通话的号（防止幽灵排队）
+            waiting_calls = [c for c in waiting_calls if c["number"] != customer_number]
+            background_tasks.add_task(broadcast_admin, "queue_update", waiting_calls)
+
+
+async def send_setup_message(
+    ws,
+    customer_info: dict,
+    menu_text: str,
+    restaurant_info: str,
+    customer_number: str
+):
+    """
+    向 Gemini 发送初始化 Setup 消息，定义 AI 的完整配置。
+
+    此消息必须是与 Gemini 的 WebSocket 连接建立后发送的第一条消息，
+    在任何音频或文本交换之前完成初始化。
+
+    Setup 消息包含：
+        1. model：使用的 Gemini 模型名称（如 gemini-2.5-flash-...）
+        2. generationConfig：
+           - responseModalities: ["AUDIO"] — 仅输出音频，减少文本处理延迟
+           - speechConfig.voiceConfig：指定 TTS 语音（如 Aoede）
+        3. inputAudioTranscription: {} — 启用用户语音实时转录功能
+        4. systemInstruction：AI 的系统提示词（人设、规则、菜单、客户信息）
+        5. tools：注册可供 AI 调用的工具函数列表
+
+    Args:
+        ws: Gemini WebSocket 连接对象
+        customer_info (dict | None): 客户档案（老客户有历史数据，新客户为 None）
+        menu_text (str): 格式化的菜单文本
+        restaurant_info (str): 餐厅基本信息文本
+        customer_number (str): 来电号码
+    """
+    # 通过 prompts 模块动态生成 System Prompt
+    base_instruction = prompts.get_system_instruction(
+        customer_info, menu_text, restaurant_info, customer_number
+    )
+
+    setup_payload = {
+        "setup": {
+            "model": config.model_name,
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": config.voice_name
+                        }
+                    }
+                }
+                # "thinkingConfig" was removed here. Google's default thinking behavior will be restored, making the AI smarter.
+            },
+            # 恢复用户语音实时转录（与 mid-call 1008 无关，该字段支持此模型）
+            "inputAudioTranscription": {},
+            "systemInstruction": {
+                "parts": [{"text": base_instruction}]
+            },
+            "tools": [
+                tools_address.tool_definition,
+                tools_pricing.definition,
+                tools_manage_call.tool_definition,
+                tools_history.definition
+            ]
+        }
+    }
+
+    payload_json = json.dumps(setup_payload)
+    payload_size = len(payload_json)
+    instruction_size = len(base_instruction)
+    logger.info(
+        f"发送 Gemini setup | 模型: {config.model_name} | "
+        f"Setup 总大小: {payload_size:,} 字节 | 系统指令大小: {instruction_size:,} 字节"
+    )
+    await ws.send(payload_json)
+
+
+# =============================================================================
+# Web 通话模拟器（管理面板内的测试功能）
+# =============================================================================
+
+@app.websocket("/api/admin/web_call")
+async def handle_web_call_stream(websocket: WebSocket, token: str = None):
+    """
+    Web 通话模拟器 WebSocket 端点 (Token Query 鉴权)。
+
+    功能：
+        允许在管理面板中通过浏览器麦克风直接与 AI 对话，
+        模拟真实的电话通话场景，无需真实的 Twilio 电话。
+        主要用于：
+            1. 测试新的 prompts.py 修改是否正确
+            2. 测试菜单更改后 AI 的响应
+            3. 展示系统功能（演示模式）
+
+    与 /media-stream 的区别：
+        - /media-stream：Twilio 发送 mu-law 8kHz，需要转码
+        - /api/admin/web_call：浏览器直接发送 PCM 16kHz，无需转码
+        - /media-stream：Gemini 输出转为 mu-law 发给 Twilio
+        - /api/admin/web_call：Gemini 输出原始 PCM 24kHz 发给浏览器
+
+    协议（前端须遵循）：
+        连接后，前端首先发送 start 事件：
+            {"event": "start", "customer_number": "08x..."}
+        
+        之后持续发送音频：
+            {"event": "media", "payload": "<Base64 PCM 16kHz>"}
+        
+        服务端回复音频：
+            {"event": "media", "payload": "<Base64 PCM 24kHz>", "sampleRate": 24000}
+        
+        打断信号：
+            {"event": "clear"}
+        
+        通话结束（AI 主动）：
+            {"event": "close"}
+        
+        用户主动挂断：
+            {"event": "stop"}
+    """
+    if not token or token not in TOKEN_STORE:
+        await websocket.close(code=1008)
+        return
+    
+    if time.time() > TOKEN_STORE[token]["expires"]:
+        del TOKEN_STORE[token]
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    logger.info("Web Call Simulator WebSocket 连接已建立")
+    await broadcast_admin("system_log", {
+        "message": "Web RTC Simulator 握手成功，等待启动...",
+        "type": "info"
+    })
+
+    stream_call_sid = None  # 在 finally 块中使用，需要在 try 块外初始化
+    
+    global global_ai_busy, waiting_calls
+    # 防线 1: 接通前互斥拦截 WebRTC
+    # 如果系统当前处于繁忙（例如正在接头 Twilio 或另一个 Web 模拟器）
+    if global_ai_busy:
+        logger.info("Web 模拟连接被拒绝：AI 当前忙碌中")
+        await websocket.close(code=1008, reason="AI is currently serving another customer")
+        return
+        
+    # 上锁：Web RTC 霸占 AI 线
+    global_ai_busy = True
+    background_tasks.add_task(broadcast_admin, "ai_status", {"busy": True})
+
+    try:
+        # --- 等待前端发送 start 事件 ---
+        init_message = await websocket.receive_text()
+        init_data = json.loads(init_message)
+
+        if init_data.get('event') != 'start':
+            # 首条消息不是 start，协议错误，关闭连接
+            await websocket.close(code=1003, reason="Expected 'start' event")
+            return
+
+        # 提取模拟通话的"来电号码"（用于查询客户档案）
+        customer_number = init_data.get('customer_number', '').strip()
+        if not customer_number:
+            customer_number = 'Unknown'
+
+        # 生成唯一的模拟通话 SID（避免与真实 Twilio CallSid 冲突）
+        stream_call_sid = f"web_{uuid.uuid4().hex[:8]}"
+
+        logger.info(f"Web 模拟通话开始，虚拟号码: {customer_number}")
+
+        # 建立与 Gemini 的 WebSocket 连接
+        async with ws_connect(
+            config.gemini_ws_uri,
+            extra_headers={"Content-Type": "application/json"}
+        ) as gemini_ws:
+
+            await broadcast_admin("system_log", {
+                "message": "已连接至 Google Gemini V2 Live API (WebRTC)。",
+                "type": "success"
+            })
+
+            call_transcript = []  # 记录该通 Web 测试电话的对话记录
+            draft_order = {}      # 草稿订单缓存（供 POS 使用）
+            order_finalized = False # 标记记录是否已归档
+
+            # 查询客户档案
+            customer_info = database.get_customer(customer_number)
+            caller_name = (
+                customer_info.get('name', 'Web Tester')
+                if customer_info else 'Web Tester'
+            )
+
+            # 记录活跃通话
+            ACTIVE_CALLS[stream_call_sid] = {
+                "start_time": time.time(),
+                "caller_number": customer_number,
+                "caller_name": caller_name
+            }
+            await broadcast_admin("call_start", {
+                "call_sid": stream_call_sid,
+                "caller": customer_number,
+                "caller_name": caller_name,
+                "active_count": len(ACTIVE_CALLS),
+                "active_calls": ACTIVE_CALLS
+            })
+
+            # 加载菜单和餐厅信息，发送 Setup 消息给 Gemini
+            menu_text = database.get_menu_text()
+            restaurant_info = database.get_restaurant_info()
+            await send_setup_message(
+                gemini_ws, customer_info, menu_text,
+                restaurant_info, customer_number
+            )
+
+            # 发送触发器，使 AI 主动开口打招呼
+            await gemini_ws.send(json.dumps({
+                "clientContent": {
+                    "turns": [{
+                        "role": "user",
+                        "parts": [{"text": "Call connected. Please greet the customer."}]
+                    }],
+                    "turnComplete": True
+                }
+            }))
+
+            # -----------------------------------------------------------------------
+            # 内部任务 A：浏览器 → Gemini（接收用户麦克风音频）
+            # -----------------------------------------------------------------------
+            async def receive_from_browser():
+                """
+                持续接收浏览器发来的音频数据，直接转发给 Gemini。
+
+                浏览器直接发送 PCM 16kHz 的 Base64 编码数据，
+                无需音频格式转换（这与 Twilio 端的 mu-law 转码不同）。
+
+                支持两种事件：
+                    - media：音频数据 → 转发给 Gemini
+                    - stop：用户主动挂断 → 退出任务
+                """
+                try:
+                    while True:
+                        message = await websocket.receive_text()
+                        data = json.loads(message)
+
+                        if data.get('event') == 'media':
+                            b64_pcm_16k = data.get('payload')
+                            if b64_pcm_16k:
+                                print(f"📞 [WebSim] Received audio chunk: {len(b64_pcm_16k)} bytes | Preview: {b64_pcm_16k[:30]}...")
+                                # 浏览器已经提供了正确格式（PCM 16kHz），直接发给 Gemini
+                                await gemini_ws.send(json.dumps({
+                                    "realtimeInput": {
+                                        "audio": {
+                                            "data": b64_pcm_16k,
+                                            "mimeType": f"audio/pcm;rate={config.gemini_input_sample_rate}"
+                                        }
+                                    }
+                                }))
+
+                        elif data.get('event') == 'stop':
+                            logger.info("Web 浏览器主动挂断模拟电话")
+                            return  # 退出任务
+
+                except WebSocketDisconnect:
+                    logger.info("Web 浏览器意外断开连接")
+                    return
+                except Exception as e:
+                    logger.error(f"Web 浏览器接收循环异常: {e}")
+                    return
+
+            # -----------------------------------------------------------------------
+            # 内部任务 B：Gemini → 浏览器（接收 AI 回复音频 + 处理工具调用）
+            # -----------------------------------------------------------------------
+            async def receive_from_gemini():
+                """
+                接收 Gemini 的响应，处理音频、转录、打断、工具调用。
+                """
+                nonlocal draft_order, order_finalized
+                current_user_transcript_web = ""  # Web 端用户转录缓冲区
+                current_ai_transcript_web = ""    # Web 端 AI 转录缓冲区
+
+                typing_event = None
+                typing_task = None
+                
+                def start_typing_sound():
+                    nonlocal typing_event, typing_task
+                    if typing_event is None or typing_event.is_set():
+                        import audio_injector
+                        typing_event = asyncio.Event()
+                        typing_task = asyncio.create_task(
+                            audio_injector.stream_audio_to_websocket(
+                                websocket, "webrtc", typing_event
+                            )
+                        )
+
+                def stop_typing_sound():
+                    nonlocal typing_event
+                    if typing_event and not typing_event.is_set():
+                        typing_event.set()
+
+                try:
+                    async for message in gemini_ws:
+                        response = json.loads(message)
+
+                        audio_data_parts = []
+
+                        if 'serverContent' in response:
+                            server_content = response['serverContent']
+
+                            if 'modelTurn' in server_content:
+                                parts = server_content['modelTurn'].get('parts', [])
+                                for part in parts:
+                                    if 'inlineData' in part:
+                                        audio_data_parts.append(part['inlineData']['data'])
+                                        stop_typing_sound()
+                                    if 'text' in part:
+                                        text_content = part['text']
+                                        start_typing_sound()
+                                        logger.info(f"Gemini (Web) 文本响应: {text_content}")
+                                        call_transcript.append({
+                                            "role": "thought", 
+                                            "text": f"💭 思考过程: {text_content}", 
+                                            "timestamp": time.time()
+                                        })
+                                        await broadcast_admin("transcript", {
+                                            "call_sid": stream_call_sid,
+                                            "role": "thought",
+                                            "text": f"💭 思考过程: {text_content}",
+                                            "is_final": True
+                                        })
+
+                            # 用户语音实时转录
+                            if 'inputTranscription' in server_content:
+                                transcription = server_content['inputTranscription']
+                                if 'text' in transcription and transcription['text']:
+                                    text_chunk = transcription['text']
+                                    current_user_transcript_web += text_chunk
+                                    stop_typing_sound()
+                                    print(f"\033[93m{text_chunk}\033[0m", end="", flush=True)
+                                    await broadcast_admin("transcript", {
+                                        "call_sid": stream_call_sid,
+                                        "role": "user",
+                                        "text": text_chunk,
+                                        "is_final": False
+                                    })
+
+                            # AI 输出转录
+                            if 'outputTranscription' in server_content:
+                                text_chunk = server_content['outputTranscription'].get('text', '')
+                                if text_chunk:
+                                    current_ai_transcript_web += text_chunk
+                                    print(f"\033[96m{text_chunk}\033[0m", end="", flush=True)
+                                    await broadcast_admin("transcript", {
+                                        "call_sid": stream_call_sid,
+                                        "role": "ai",
+                                        "text": text_chunk,
+                                        "is_final": False
+                                    })
+
+                            # 打断处理（Web 端：发送 clear 事件给浏览器）
+                            if server_content.get('interrupted'):
+                                word_count = len(current_user_transcript_web.strip().split())
+                                stop_typing_sound()
+                                if word_count > 1:
+                                    logger.info("⚠️ 有效打断 (Web) → 发送清空指令给浏览器")
+                                    await websocket.send_json({"event": "clear"})
+                                current_user_transcript_web = ""
+
+                            # 回合结束
+                            if 'turnComplete' in server_content and server_content['turnComplete']:
+                                print("")
+                                if current_user_transcript_web:
+                                    call_transcript.append({
+                                        "role": "user", 
+                                        "text": current_user_transcript_web, 
+                                        "timestamp": time.time()
+                                    })
+                                    await broadcast_admin("transcript", {
+                                        "call_sid": stream_call_sid,
+                                        "role": "user",
+                                        "text": current_user_transcript_web,
+                                        "is_final": True
+                                    })
+                                    current_user_transcript_web = ""
+                                
+                                if current_ai_transcript_web:
+                                    call_transcript.append({
+                                        "role": "ai", 
+                                        "text": current_ai_transcript_web, 
+                                        "timestamp": time.time()
+                                    })
+                                    await broadcast_admin("transcript", {
+                                        "call_sid": stream_call_sid,
+                                        "role": "ai",
+                                        "text": current_ai_transcript_web,
+                                        "is_final": True
+                                    })
+                                    current_ai_transcript_web = ""
+
+                        # ======= 发送音频给 Web=======
+                        if audio_data_parts:
+                            for audio_b64 in audio_data_parts:
+                                await websocket.send_json({
+                                    "event": "media",
+                                    "payload": audio_b64,
+                                    "sampleRate": 24000  # 告知浏览器采样率
+                                })
+
+                        # 工具调用处理
+                        if 'toolCall' in response:
+                            tool_call = response['toolCall']
+                            function_calls = tool_call.get('functionCalls', [])
+                            
+                            start_typing_sound()
+                            logger.info(f"Gemini (Web) 请求工具调用: {function_calls}")
+                            await broadcast_admin("tool_call", {
+                                "call_sid": stream_call_sid,
+                                "calls": function_calls
+                            })
+
+                            function_responses = []
+
+                            for call in function_calls:
+                                call_id = call['id']
+                                name = call['name']
+                                args = call.get('args', {})
+
+                                result = None
+                                try:
+                                    # Web 模拟器支持的工具集（与 Twilio 保持同步）
+                                    if name == 'search_address':
+                                        query = args.get('address_query')
+                                        result = await tools_address.search_address(query)
+                                    elif name == 'calculate_total':
+                                        result = tools_pricing.calculate_total(
+                                            args.get('items', []),
+                                            args.get('delivery_fee', 0.0),
+                                            args.get('payment_method', 'cash')
+                                        )
+                                        
+                                        # 同步缓存并在管理面板更新直播单小票
+                                        draft_order = {
+                                            "items": args.get('items', []),
+                                            "delivery_fee": args.get('delivery_fee', 0.0),
+                                            "payment_method": args.get('payment_method', 'unknown'),
+                                            "calculate_total_result": result.get('result', ''),
+                                            "subtotal": result.get('subtotal', 0.0),
+                                            "total": result.get('total', 0.0)
+                                        }
+                                        await broadcast_admin("live_order_update", draft_order)
+                                        result = result.get('result', "Total calculated.") # WebSim expects result inner dict
+                                    elif name == 'get_past_order':
+                                        o_id = args.get('order_id')
+                                        result_dict = tools_history.get_past_order(o_id)
+                                        result = result_dict.get('result', "No history found.")
+                                    elif name == 'get_business_hours':
+                                        result = prompts.get_business_hours() if hasattr(prompts, 'get_business_hours') else {"error": "Not implemented"}
+                                    elif name == 'get_restaurant_status':
+                                        result = prompts.get_restaurant_status() if hasattr(prompts, 'get_restaurant_status') else {"error": "Not implemented"}
+                                    elif name == 'check_delivery_availability':
+                                        addr = args.get('address', '')
+                                        result = {"delivery_fee": database.get_delivery_fee(addr)}
+                                    elif name == 'end_call':
+                                        # 保存模拟订单（标记来源为 "AI (WebSim)"）
+                                        order_finalized = True
+                                        items = args.get('items', [])
+                                        total = args.get('total_value', args.get('total_amount', 0))
+                                        s_type = args.get('service_type', 'Pickup')
+                                        order_note = args.get('note', args.get('special_instructions', ''))
+                                        contact_phone = args.get('contact_phone', customer_number)
+
+                                        try:
+                                            order_id = f"AID{int(time.time() * 100)}"
+                                            order_record = {
+                                                "order_id": order_id,
+                                                "business_date_str": get_business_date_str(),
+                                                "timestamp": time.ctime(),
+                                                "customer_phone": customer_number,
+                                                "contact_phone": contact_phone,
+                                                "customer_name": args.get(
+                                                    'customer_name',
+                                                    customer_info.get('name') if customer_info else "Unknown"
+                                                ),
+                                                "service_type": s_type,
+                                                "address": args.get(
+                                                    'customer_address',
+                                                    customer_info.get('address') if customer_info else "Pickup"
+                                                ),
+                                                "delivery_area": args.get('delivery_area', 'Unknown'),
+                                                "items": items,
+                                                "total_value": total,
+                                                "payment_method": args.get('payment_method', 'Unknown'),
+                                                "note": order_note,
+                                                "source": "AI (WebSim)",  # 标记为 Web 模拟器订单
+                                                "transcript": json.dumps(call_transcript)
+                                            }
+
+                                            database.save_order(order_record)
+                                            summary = f"{order_id}: {len(items)} items (€{total})"
+                                            database.update_customer_history(
+                                                customer_number, summary,
+                                                name=args.get('customer_name'),
+                                                address=args.get('customer_address')
+                                            )
+                                            logger.info(f"✅ Web模拟订单归档: {order_id}")
+
+                                            # 更新管理面板的今日订单计数
+                                            _completed, _incomplete = get_order_counts()
+                                            await broadcast_admin("new_order", {
+                                                "total_orders": _completed,
+                                                "incomplete_orders": _incomplete,
+                                                "order_id": order_id
+                                            })
+
+                                            # [BUG FIX] save_order 成功后必须设置 result，
+                                            # 否则会触发下方 "if result is None" 分支，
+                                            # 错误地向 Gemini 返回 "Function not implemented"
+                                            result = {"status": "success", "order_id": order_id}
+
+                                        except Exception as e:
+                                            logger.error(f"Web模拟订单归档失败: {e}")
+                                            result = {"status": "error", "message": str(e)}
+
+                                    # 转接人工：立即通知浏览器关闭连接
+                                    elif name == 'transfer_call':
+                                        logger.info(f"AI 主动请求结束模拟通话: {name}")
+                                        await websocket.send_json({"event": "close"})
+                                        await gemini_ws.close()
+                                        return  # 退出任务 B
+
+                                    if result is None:
+                                        result = {"error": "Function not implemented or failed"}
+
+                                except Exception as e:
+                                    logger.error(f"工具 {name} 执行失败: {e}")
+                                    result = {"error": str(e)}
+
+                                function_responses.append({
+                                    "id": call_id,
+                                    "name": name,
+                                    "response": {"result": result}
+                                })
+
+                            # 将工具结果发回给 Gemini
+                            if function_responses:
+                                stop_typing_sound()
+                                start_typing_sound()
+                                await gemini_ws.send(json.dumps({
+                                    "toolResponse": {
+                                        "functionResponses": function_responses
+                                    }
+                                }))
+
+                                # 广播工具响应到管理面板（可视化调试）
+                                await broadcast_admin("tool_response", {
+                                    "call_sid": stream_call_sid,
+                                    "responses": function_responses
+                                })
+
+                except ConnectionClosed:
+                    logger.info("Gemini (Web) WebSocket 断开")
+                except Exception as e:
+                    import traceback
+                    logger.error(f"Gemini (Web) 接收任务异常: {e}\n{traceback.format_exc()}")
+
+            # 启动双向并发任务
+            task_a = asyncio.create_task(receive_from_browser())
+            task_b = asyncio.create_task(receive_from_gemini())
+
+            # 等待任意一个任务完成，然后取消另一个
+            done, pending = await asyncio.wait(
+                [task_a, task_b],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for p in pending:
+                p.cancel()
+
+    except Exception as e:
+        logger.error(f"Web 模拟通话全局异常: {e}")
+    finally:
+        # ★ WebRTC 草稿订单救援：若模拟通话中途丢失连接，同样挽救订单
+        if not order_finalized and stream_call_sid and draft_order:
+            try:
+                rescue_id = f"AID-INCOMPLETE-{int(time.time())}"
+                rescue_record = {
+                    "order_id": rescue_id,
+                    "business_date_str": get_business_date_str(),
+                    "timestamp": time.ctime(),
+                    "customer_phone": customer_number,
+                    "contact_phone": None,
+                    "customer_name": customer_info.get('name', 'Web Tester') if customer_info else 'Web Tester',
+                    "service_type": "Unknown (Web Call Dropped)",
+                    "address": customer_info.get('address', 'Unknown') if customer_info else 'Unknown',
+                    "delivery_area": "Unknown",
+                    "items": draft_order.get('items', []) if draft_order else [],
+                    "total_value": draft_order.get('total', 0.0) if draft_order else 0.0,
+                    "payment_method": draft_order.get('payment_method', 'Unknown') if draft_order else 'Unknown',
+                    "delivery_fee": draft_order.get('delivery_fee', 0.0) if draft_order else 0.0,
+                    "note": f"⚠️ 模拟通话断开。报价详情: {draft_order.get('calculate_total_result', '无报价') if draft_order else '无报价'}",
+                    "source": "AI (WebSim Incomplete)",
+                    "transcript": json.dumps(call_transcript)
+                }
+                database.save_order(rescue_record)
+                logger.warning(f"⚠️ WebSim草稿订单已救援保存: {rescue_id}")
+                _completed, _incomplete = get_order_counts()
+                await broadcast_admin("new_order", {
+                    "total_orders": _completed,
+                    "incomplete_orders": _incomplete,
+                    "order_id": rescue_id,
+                    "warning": "Web模拟通话意外断开，系统已挽救未完成订单。"
+                })
+            except Exception as e:
+                logger.error(f"WebSim草稿订单救援失败: {e}")
+
+        # 清理活跃通话记录并广播
+        if stream_call_sid and stream_call_sid in ACTIVE_CALLS:
+            del ACTIVE_CALLS[stream_call_sid]
+            await broadcast_admin("call_end", {
+                "call_sid": stream_call_sid,
+                "active_count": len(ACTIVE_CALLS),
+                "active_calls": ACTIVE_CALLS
+            })
+        logger.info(f"Web 模拟通话已清理，SID: {stream_call_sid}")
+
+
+# =============================================================================
+# 前端 SPA 路由（生产环境 Catch-all）
+# =============================================================================
+
+@app.get("/{full_path:path}")
+async def serve_frontend(request: Request, full_path: str):
+    """
+    前端单页应用（SPA）的 Catch-all 路由。
+
+    工作原理：
+        FastAPI 路由匹配遵循"先定义先匹配"原则。
+        所有已定义的 /api/* 和 /assets/* 路由会优先匹配。
+        只有在没有任何路由匹配时，才会到达此 Catch-all 路由。
+
+    文件服务逻辑（两步）：
+        1. 先检查请求路径是否对应 dist/ 目录下的真实文件
+           （处理 logo.png、vite.svg、favicon 等根目录静态资源）
+           如果是真实文件，直接返回该文件（FileResponse）
+        2. 如果不是真实文件，返回 index.html
+           让前端 JavaScript Router 处理 SPA 页面路由
+
+    重要：
+        如果没有步骤1，根目录的静态文件（logo.png 等）会被错误地
+        返回 index.html（HTML 内容），导致图片/图标无法显示。
+
+    Args:
+        request (Request): FastAPI 请求对象（此处未使用）
+        full_path (str): 匹配的路径字符串（所有非 API 路径）
+
+    Returns:
+        FileResponse: 真实文件 或 index.html（SPA fallback）
+        JSONResponse (404): 若 dist/ 目录不存在，提示需要构建前端
+    """
+    if os.path.isdir(frontend_dist_path):
+        # 步骤1：优先检查请求路径是否对应 dist/ 中的真实文件
+        # 这处理了 logo.png、vite.svg、favicon.ico 等根目录静态资源
+        requested_file = os.path.join(frontend_dist_path, full_path)
+        if full_path and os.path.isfile(requested_file):
+            return FileResponse(requested_file)
+
+        # 步骤1.5：防止缓存投毒。如果是向 assets/ 请求旧的文件（JS/CSS），
+        # 且文件已不存在，直接返回 404，不要 fallback 到 index.html。
+        if full_path.startswith("assets/"):
+            return JSONResponse(status_code=404, content={"message": "Asset not found."})
+
+        # 步骤2：不是真实文件，返回 index.html（SPA 路由 fallback）
+        index_path = os.path.join(frontend_dist_path, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+
+    return JSONResponse(
+        status_code=404,
+        content={
+            "message": (
+                "Frontend not built or not found. "
+                "Please run 'npm run build' inside the 'frontend' directory."
+            )
+        }
+    )
+
+
+# =============================================================================
+# 服务启动入口
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    print("AI 智能点餐服务启动中...")
+    print(f"   服务地址: http://{config.host}:{config.port}")
+    print(f"   请务必运行 ngrok http {config.port} 获取公网地址并填入 Twilio 后台")
+    print("   确保已创建 .env 文件并设置好所有必需的环境变量")
+
+    try:
+        # uvicorn 是 FastAPI 推荐的 ASGI 服务器
+        # host="0.0.0.0" 允许从局域网访问，便于测试
+        uvicorn.run(app, host=config.host, port=config.port)
+    except KeyboardInterrupt:
+        print("\n\n服务已停止（用户中断，Ctrl+C）")
+    except Exception as e:
+        print(f"\n服务异常退出: {e}")

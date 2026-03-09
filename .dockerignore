@@ -1,0 +1,32 @@
+# Ignore local Python environment and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+.env
+
+# Ignore node_modules from frontend
+frontend/node_modules/
+# 多阶段构建中 dist 由 Stage1 生成，排除本地 dist 防止覆盖云端结果
+frontend/dist/
+
+# Ignore local logs and DBs
+server.log
+app.db
+*.db
+build_log.txt
+
+# Ignore settings.json (Cloud Run 环境变量优先，不覆盖)
+settings.json
+
+# Ignore Git files and IDE configs
+.git
+.gitignore
+.vscode/
+.idea/
+.cursor/
+
+# Ignore MacOS noise
+.DS_Store
