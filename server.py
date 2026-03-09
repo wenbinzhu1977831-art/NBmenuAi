@@ -431,20 +431,28 @@ async def admin_websocket(websocket: WebSocket, token: str = None):
 @app.get("/api/admin/settings")
 async def get_settings(role: str = Depends(get_current_role)):
     """
-    获取 settings.json 的完整内容。
-
-    前端使用此接口加载当前配置，填充设置表单。
-    若角色为 staff，则剔除敏感信息（API Keys、密码）后回传。
-    若文件不存在（首次部署），返回空字典，前端会使用默认值。
+    获取当前配置。
+    生产环境（Cloud SQL）：从 app_settings 表读取 settings_json key。
+    本地开发：从 settings.json 文件读取（向下兼容）。
     """
-    if os.path.exists(config.settings_file):
+    data = {}
+    if os.environ.get("CLOUD_SQL_CONNECTION_NAME"):
+        # 生产环境：从 Cloud SQL 读取
+        raw = database.get_app_setting("settings_json")
+        if raw:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = {}
+    elif os.path.exists(config.settings_file):
+        # 本地开发：从文件读取
         with open(config.settings_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if role == "staff":
-                data.pop("api_keys", None)
-                data.pop("security_settings", None)
-            return data
-    return {}
+
+    if role == "staff":
+        data.pop("api_keys", None)
+        data.pop("security_settings", None)
+    return data
 
 
 class SettingsUpdate(BaseModel):
@@ -456,21 +464,21 @@ class SettingsUpdate(BaseModel):
 async def update_settings(update_data: SettingsUpdate, role: str = Depends(verify_admin)):
     """
     保存新的配置并立即热重载到内存。
-
-    操作流程：
-        1. 将前端提交的配置字典序列化为 JSON 写入 settings.json
-        2. 调用 config.reload_settings() 将新配置加载到内存
-           （下一个来电就会使用新配置，无需重启）
-
-    Returns:
-        dict: {"status": "success", "message": "..."}
+    生产环境：写入 Cloud SQL app_settings 表。
+    本地开发：写入 settings.json 文件。
     """
     try:
-        with open(config.settings_file, "w", encoding="utf-8") as f:
-            json.dump(update_data.settings, f, indent=2, ensure_ascii=False)
+        json_str = json.dumps(update_data.settings, indent=2, ensure_ascii=False)
+        if os.environ.get("CLOUD_SQL_CONNECTION_NAME"):
+            # 生产环境：存入 Cloud SQL
+            database.save_app_setting("settings_json", json_str)
+        else:
+            # 本地开发：写入文件
+            with open(config.settings_file, "w", encoding="utf-8") as f:
+                f.write(json_str)
         # 立即热重载，使新配置在下次 API 调用时生效
         config.reload_settings()
-        return {"status": "success", "message": "Settings updated and reloaded"}
+        return {"status": "success", "message": "Settings saved to Cloud SQL and reloaded"}
     except Exception as e:
         logger.error(f"保存配置失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -644,12 +652,13 @@ async def factory_reset_menu():
 @app.get("/api/admin/delivery_areas")
 async def get_delivery_areas():
     """
-    读取配送区域文本文件内容，供前端文本编辑器使用。
-
-    Returns:
-        dict: {"content": "<Delivery Area.txt 的文本内容>"}
-              文件不存在时返回 {"content": ""}
+    读取配送区域文本内容。
+    生产环境：从 Cloud SQL app_settings 表读取。
+    本地开发：从 delivery_areas.txt 文件读取。
     """
+    if os.environ.get("CLOUD_SQL_CONNECTION_NAME"):
+        content = database.get_app_setting("delivery_areas") or ""
+        return {"content": content}
     if os.path.exists(config.delivery_areas_file):
         with open(config.delivery_areas_file, "r", encoding="utf-8") as f:
             return {"content": f.read()}
@@ -659,28 +668,18 @@ async def get_delivery_areas():
 @app.post("/api/admin/delivery_areas")
 async def save_delivery_areas(payload: dict):
     """
-    保存配送区域文本并清除对应的内存缓存。
-
-    配送区域文本格式（Delivery Area.txt）：
-        Drogheda ........ €3
-        Drogheda Rural .. €5
-        Dunleer ......... €5.50
-
-    操作完成后清除 load_delivery_areas 的 lru_cache，
-    确保下次查询时读取最新的配送区域数据。
-
-    Args:
-        payload (dict): 请求体，包含 "content" 字段（文本内容）
-
-    Returns:
-        dict: {"status": "success"}
+    保存配送区域文本并清除内存缓存。
+    生产环境：写入 Cloud SQL app_settings 表。
+    本地开发：写入 delivery_areas.txt 文件。
     """
     try:
         content = payload.get("content", "")
-        with open(config.delivery_areas_file, "w", encoding="utf-8") as f:
-            f.write(content)
-        # [BUG FIX] 清除配送区域缓存，确保新数据立即生效
-        import database
+        if os.environ.get("CLOUD_SQL_CONNECTION_NAME"):
+            database.save_app_setting("delivery_areas", content)
+        else:
+            with open(config.delivery_areas_file, "w", encoding="utf-8") as f:
+                f.write(content)
+        # 清除配送区域缓存，确保新数据立即生效
         database.load_delivery_areas.cache_clear()
         return {"status": "success"}
     except Exception as e:

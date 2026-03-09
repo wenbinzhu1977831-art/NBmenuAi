@@ -267,10 +267,27 @@ class AppConfig:
             - 任何解析错误都会被捕获，不会导致服务崩溃
         """
         try:
-            if os.path.exists(self.settings_file):
+            data = {}
+            if os.environ.get("CLOUD_SQL_CONNECTION_NAME"):
+                # 生产环境：从 Cloud SQL 读取配置
+                try:
+                    from database import get_app_setting
+                    raw = get_app_setting("settings_json")
+                    if raw:
+                        data = json.loads(raw)
+                        logger.info("✅ 动态配置重载成功 (从 Cloud SQL 读取)")
+                    else:
+                        logger.warning("⚠️ Cloud SQL app_settings 中无 settings_json，将使用系统默认值")
+                except Exception as db_err:
+                    logger.error(f"❌ 从 Cloud SQL 读取配置失败: {db_err}，尝试回退到文件")
+            
+            if not data and os.path.exists(self.settings_file):
+                # 本地开发（或 Cloud SQL 读取失败）：从文件读取
                 with open(self.settings_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+                logger.info("✅ 动态配置重载成功 (从本地文件读取)")
 
+            if data:
                     # --- 从 settings.json 更新安全与 API 密钥（若非空则覆盖 .env 的值）---
                     keys = data.get('api_keys', {})
                     if keys.get('google_api_key'):
@@ -307,10 +324,9 @@ class AppConfig:
                     self.discount_description = pricing.get('discount_description', self.discount_description)
                     self.discount_type = pricing.get('discount_type', self.discount_type)
                     self.discount_value = pricing.get('discount_value', self.discount_value)
-
-                logger.info("✅ 动态配置重载成功 (Settings loaded)")
             else:
-                logger.warning(f"⚠️ 找不到配置文件: {self.settings_file}，将使用系统默认值")
+                logger.warning(f"⚠️ 无配置数据，将使用系统默认值")
+
 
         except Exception as e:
             logger.error(f"❌ 加载 settings.json 失败: {e}")

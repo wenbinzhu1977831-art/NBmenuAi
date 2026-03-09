@@ -22,7 +22,7 @@ from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from models import init_db, Order, Customer, MenuCategory, MenuItem, MenuOption
+from models import init_db, Order, Customer, MenuCategory, MenuItem, MenuOption, AppSetting
 from config import config
 
 logger = logging.getLogger("AI-Waiter")
@@ -47,6 +47,44 @@ def _get_session_factory():
 def get_db_session():
     """获取一个新的数据库 Session（Context Manager）"""
     return _get_session_factory()()
+
+
+# =============================================================================
+# App Settings 键值操作 — 持久化配置存 Cloud SQL 而不是本地文件
+# =============================================================================
+
+def get_app_setting(key: str) -> Optional[str]:
+    """
+    从 app_settings 表读取配置值。
+    Cloud Run 生产环境才会调用（由 config.py 在 CLOUD_SQL_CONNECTION_NAME 存在时触发）。
+    返回 None 表示 key 不存在。
+    """
+    try:
+        with get_db_session() as db:
+            row = db.query(AppSetting).filter_by(key=key).first()
+            return row.value if row else None
+    except Exception as e:
+        logger.error(f"读取 app_setting[{key}] 失败: {e}")
+        return None
+
+
+def save_app_setting(key: str, value: str) -> bool:
+    """
+    将配置值写入 app_settings 表（upsert）。
+    返回 True 表示成功。
+    """
+    try:
+        with get_db_session() as db:
+            row = db.query(AppSetting).filter_by(key=key).first()
+            if row:
+                row.value = value
+            else:
+                db.add(AppSetting(key=key, value=value))
+            db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"写入 app_setting[{key}] 失败: {e}")
+        return False
 
 
 # =============================================================================
@@ -216,20 +254,38 @@ RESTAURANT_INFO_FILE = config.restaurant_info_file
 
 @lru_cache(maxsize=1)
 def load_delivery_areas() -> Dict[str, float]:
-    """保持从 Txt 读取，因为只需偶尔操作且有 LRU 缓存拦截"""
+    """
+    加载配送区域及费率。
+    生产环境（Cloud SQL）：优先从 app_settings 表读取。
+    本地开发：从 delivery_areas.txt 文件读取（向下兼容）。
+    """
     areas = {}
-    try:
-        if os.path.exists(DELIVERY_FILE):
+    raw_text = None
+
+    # 生产环境：从 Cloud SQL 读取
+    if os.environ.get("CLOUD_SQL_CONNECTION_NAME"):
+        raw_text = get_app_setting("delivery_areas")
+
+    # 本地开发（或 Cloud SQL 里还没有数据）：从文件读取
+    if raw_text is None and os.path.exists(DELIVERY_FILE):
+        try:
             with open(DELIVERY_FILE, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-            for line in lines:
-                if "€" in line and "..." in line:
-                    parts = line.split("€")
-                    price = float(parts[1].strip())
-                    name_part = parts[0].strip().rstrip(" .")
-                    areas[name_part.lower()] = price
+                raw_text = f.read()
+        except Exception as e:
+            logger.error(f"读取 delivery_areas.txt 失败: {e}")
+
+    if not raw_text:
+        return areas
+
+    try:
+        for line in raw_text.splitlines():
+            if "€" in line and "..." in line:
+                parts = line.split("€")
+                price = float(parts[1].strip())
+                name_part = parts[0].strip().rstrip(" .")
+                areas[name_part.lower()] = price
     except Exception as e:
-        logger.error(f"加载配送区域时出错: {e}")
+        logger.error(f"解析配送区域时出错: {e}")
     return areas
 
 def get_restaurant_info() -> str:

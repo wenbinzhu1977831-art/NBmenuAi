@@ -10,6 +10,25 @@ logger = logging.getLogger("AI-Waiter")
 Base = declarative_base()
 
 # =============================================================================
+# App Settings Model — 持久化配置（代替 settings.json / delivery_areas.txt）
+# =============================================================================
+class AppSetting(Base):
+    """
+    通用键值配置表。
+    存储所有原本保存在容器文件系统上的配置，确保跨部署持久化。
+
+    常用 key：
+        'settings_json'    → 完整的 settings.json JSON 字符串
+        'delivery_areas'   → delivery_areas.txt 原始文本内容
+    """
+    __tablename__ = 'app_settings'
+
+    key        = Column(String(100), primary_key=True)
+    value      = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# =============================================================================
 # Customer Data Model
 # =============================================================================
 class Customer(Base):
