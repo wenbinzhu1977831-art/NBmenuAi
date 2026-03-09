@@ -1238,7 +1238,7 @@ async def transfer_queued_call(
 # =============================================================================
 
 @app.post("/incoming-call")
-async def incoming_call(request: Request):
+async def incoming_call(request: Request, background_tasks: BackgroundTasks):
     """
     Twilio 电话呼入入口（Webhook）。
 
