@@ -1838,7 +1838,7 @@ function OrdersModal({ isOpen, onClose, orders, selectedOrder, setSelectedOrder,
                 </button>
                 <span>订单详情: {selectedOrder.id}</span>
               </>
-            ) : "历史订单追踪 (历史及今日)"}
+            ) : <><CheckCircle2 size={18} className="text-green-400" /> 今日订单 <span className="text-yellow-400 text-sm font-normal ml-2">⚠️ 未完成/错误通话置顶</span></>}
           </h2>
           <button onClick={onClose} className="text-slate-400 hover:text-white p-2">✕</button>
         </div>
