@@ -2997,7 +2997,6 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
         logger.info(f"Web 模拟通话已清理，SID: {stream_call_sid}")
 
         # --- WebRTC Wait Queue 解锁机制 ---
-        global global_ai_busy
         global_ai_busy = False
         await broadcast_admin("ai_status", {"busy": False})
 
