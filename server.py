@@ -377,6 +377,19 @@ async def change_password(req: PasswordChangeRequest, role: str = Depends(verify
 # 均受 Token 保护。基础查看受 get_current_role 保护，写配置受 verify_admin 保护。
 # =============================================================================
 
+@app.post("/api/admin/reset-busy")
+async def reset_busy(role: str = Depends(verify_admin)):
+    """
+    紧急重置 AI 繁忙锁。
+    当 Twilio 通话意外断开导致 global_ai_busy 卡在 True 时，
+    管理员可通过此端点强制释放锁，无需重启服务器。
+    """
+    global global_ai_busy
+    global_ai_busy = False
+    await broadcast_admin("ai_status", {"busy": False})
+    logger.warning("⚠️ 管理员手动重置了 global_ai_busy 锁定状态")
+    return {"status": "ok", "message": "AI busy lock has been reset"}
+
 @app.websocket("/api/admin/ws")
 async def admin_websocket(websocket: WebSocket, token: str = None):
     """
@@ -2305,7 +2318,8 @@ async def send_setup_message(
                         "prebuiltVoiceConfig": {
                             "voiceName": config.voice_name
                         }
-                    }
+                    },
+                    "languageCodes": ["en-US"]
                 }
                 # "thinkingConfig" was removed here. Google's default thinking behavior will be restored, making the AI smarter.
             },

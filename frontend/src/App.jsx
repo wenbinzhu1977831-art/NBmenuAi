@@ -700,7 +700,8 @@ function App() {
 
   const handleOpenOrdersModal = async () => {
     try {
-      const res = await axios.get(`${API_URL}/orders?all=true`);
+      // Dashboard modal shows TODAY's orders only (not all history)
+      const res = await axios.get(`${API_URL}/orders`);
       setAllOrdersList(res.data.orders);
       setShowOrdersModal(true);
       setSelectedOrder(null); // Reset detail view
