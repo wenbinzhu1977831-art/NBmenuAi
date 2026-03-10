@@ -4,7 +4,7 @@ import {
   Settings, Bot, PhoneCall, ListOrdered, FileText, 
   RefreshCw, Save, CheckCircle2, XCircle, Power, 
   Webhook, BookOpen, Coffee, Code, Hash, Euro, Globe, Terminal, User, Users, MapPin, Trash2,
-  BarChart2, Lock, LogOut, PhoneForwarded
+  BarChart2, Lock, LogOut, PhoneForwarded, PhoneIncoming
 } from 'lucide-react';
 import CodeEditor from './components/CodeEditor';
 
@@ -1084,44 +1084,72 @@ function App() {
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full pb-4">
                  {/* Left Column: Stats & Operations (Span 3 now - smaller and more left) */}
                  <div className="lg:col-span-3 space-y-3 flex flex-col overflow-y-auto right-pane-scrollbar">
-                    {/* Wait Queue Visual Display */}
-                    <div className={`border rounded-xl p-3 min-h-[140px] flex flex-col ${waitQueue?.length > 0 ? "bg-amber-950/20 border-amber-900/50" : "bg-slate-900 border-slate-800"}`}>
-                      <h3 className={`text-sm font-medium mb-3 flex items-center justify-between ${waitQueue?.length > 0 ? "text-amber-400" : "text-slate-400"}`}>
-                        <span className="flex items-center gap-1.5"><ListOrdered size={14}/> {t('waitQueueTitle')}</span>
-                        {waitQueue?.length > 0 && <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full text-[10px] font-bold">{waitQueue.length} Waiting</span>}
-                      </h3>
-                      <div className="flex-1 overflow-y-auto pr-1 space-y-2">
-                        {waitQueue && waitQueue.length > 0 ? (
-                          waitQueue.map((caller, idx) => {
-                            const waitDurationMinutes = Math.floor((Date.now() / 1000 - caller.joined_at) / 60);
-                            const isTransferring = transferringSid === caller.call_sid;
-                            return (
-                              <div key={idx} className="flex justify-between items-center bg-slate-950 p-2 rounded-lg border border-slate-800 shadow-sm animate-pulse-slow">
-                                <span className="text-xs font-mono text-slate-300 font-medium tracking-wider">{caller.number}</span>
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[10px] text-amber-500/80 bg-amber-500/10 px-1.5 py-0.5 rounded">{waitDurationMinutes} {t('minWait')}</span>
-                                  {sysRole === 'admin' && (
-                                    <button 
-                                      onClick={() => handleTransferQueue(caller.call_sid)}
-                                      disabled={isTransferring}
-                                      className={`p-1 rounded transition ${isTransferring ? 'text-slate-500 bg-slate-800' : 'text-blue-400 hover:text-blue-300 hover:bg-blue-500/10'}`}
-                                      title={t('transferBtn')}
-                                    >
-                                      <PhoneForwarded size={14} className={isTransferring ? 'animate-spin' : ''} />
-                                    </button>
+                    {/* Wait Queue Visual Display — 6-state redesign */}
+                    {(() => {
+                      const waitingCount = waitQueue?.filter(c => c.status === 'waiting').length || 0;
+                      const sortedQueue = [...(waitQueue || [])].reverse().slice(0, 10);
+                      const STATUS_CFG = {
+                        waiting:            { label: '⏳ 等待中',     cls: 'text-amber-400 bg-amber-500/10 border-amber-700/40' },
+                        connecting:         { label: '✅ AI接通中',   cls: 'text-emerald-400 bg-emerald-500/10 border-emerald-700/40' },
+                        completed:          { label: '📞 通话完毕',   cls: 'text-slate-400 bg-slate-700/20 border-slate-700/30' },
+                        auto_transferred:   { label: '🔀 已自动转接', cls: 'text-blue-400 bg-blue-500/10 border-blue-700/40' },
+                        manual_transferred: { label: '👤 手动接听',   cls: 'text-green-400 bg-green-500/10 border-green-700/40' },
+                        hung_up:            { label: '❌ 已挂断',     cls: 'text-slate-500 bg-slate-800/30 border-slate-700/20' },
+                      };
+                      return (
+                        <div className={`border rounded-xl p-3 flex flex-col ${waitingCount > 0 ? 'bg-amber-950/20 border-amber-900/50' : 'bg-slate-900 border-slate-800'}`}>
+                          <h3 className={`text-sm font-medium mb-2 flex items-center justify-between ${waitingCount > 0 ? 'text-amber-400' : 'text-slate-400'}`}>
+                            <span className="flex items-center gap-1.5"><ListOrdered size={14}/> {t('waitQueueTitle')}</span>
+                            {waitingCount > 0 && <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full text-[10px] font-bold">{waitingCount} Waiting</span>}
+                          </h3>
+                          <div className="overflow-y-auto max-h-[250px] pr-1 space-y-1.5">
+                            {sortedQueue.length > 0 ? sortedQueue.map((caller, idx) => {
+                              const cfg = STATUS_CFG[caller.status] || STATUS_CFG.hung_up;
+                              const isTerminal = caller.status !== 'waiting';
+                              const callTime = new Date(caller.joined_at * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+                              const isTransferring = transferringSid === caller.call_sid;
+                              return (
+                                <div key={idx} className={`flex items-center justify-between p-2 rounded-lg border text-[11px] ${isTerminal ? 'opacity-60' : ''} ${caller.status === 'waiting' ? 'bg-slate-950' : 'bg-slate-900/50'} border-slate-800`}>
+                                  <span className="font-mono text-slate-300 tracking-wider shrink-0">{caller.number}</span>
+                                  <span className="text-slate-500 mx-2 shrink-0">{callTime}</span>
+                                  <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium shrink-0 ${cfg.cls}`}>{cfg.label}</span>
+                                  {/* 点单标记 */}
+                                  {caller.status === 'completed' && caller.order_finalized !== null && caller.order_finalized !== undefined && (
+                                    <span className="ml-1 shrink-0" title={caller.order_finalized ? '订单已完成' : '未完成点单'}>
+                                      {caller.order_finalized ? '🟢' : '🟠'}
+                                    </span>
+                                  )}
+                                  {/* 操作按钮：仅 waiting 状态 + admin */}
+                                  {!isTerminal && sysRole === 'admin' && (
+                                    <div className="flex items-center gap-1 ml-1 shrink-0">
+                                      {!aiBusy && (
+                                        <button
+                                          onClick={async () => { try { await axios.post(`${API_URL}/queue/connect/${caller.call_sid}`); } catch(e) { showNotification('接通失败', 'error'); }}}
+                                          className="p-1 rounded text-emerald-400 hover:bg-emerald-500/10 transition" title="让 AI 立即接通"
+                                        ><PhoneIncoming size={13}/></button>
+                                      )}
+                                      <button
+                                        onClick={() => handleTransferQueue(caller.call_sid)}
+                                        disabled={isTransferring}
+                                        className={`p-1 rounded transition ${isTransferring ? 'text-slate-500' : 'text-blue-400 hover:bg-blue-500/10'}`} title="转接人工"
+                                      ><PhoneForwarded size={13} className={isTransferring ? 'animate-spin' : ''}/></button>
+                                    </div>
                                   )}
                                 </div>
+                              );
+                            }) : (
+                              <div className="flex flex-col items-center justify-center text-slate-600 space-y-2 py-6">
+                                <Coffee size={18} className="opacity-40" />
+                                <span className="text-xs">Queue is empty</span>
                               </div>
-                            );
-                          })
-                        ) : (
-                          <div className="h-full flex flex-col items-center justify-center text-slate-600 space-y-2 py-4">
-                            <Coffee size={18} className="opacity-40" />
-                            <span className="text-xs">Queue is empty</span>
+                            )}
+                            {(waitQueue?.length || 0) > 10 && (
+                              <p className="text-center text-[10px] text-slate-600 pt-1">↑ 仅显示最新10条，共{waitQueue.length}条</p>
+                            )}
                           </div>
-                        )}
-                      </div>
-                    </div>
+                        </div>
+                      );
+                    })()}
 
                     <DashboardCard 
                       title={t('aiCallsActive')} 
@@ -1341,21 +1369,8 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-slate-800">
-                    <InputGroup label={t('maxCalls')} helpText={t('maxCallsHelp')}>
-                      <div className="relative">
-                        <PhoneCall className="absolute left-3 top-2.5 text-slate-500" size={16} />
-                        <input 
-                          className="input-field pl-9" 
-                          type="number" 
-                          min="1" 
-                          max="100"
-                          value={aiSettings.max_concurrent_calls || 10} 
-                          onChange={(e) => updateSetting('ai_settings', 'max_concurrent_calls', parseInt(e.target.value, 10))} 
-                        />
-                      </div>
-                    </InputGroup>
-                    <InputGroup label={t('overflowAction')}>
+                  <div className="pt-4 border-t border-slate-800">
+                    <InputGroup label={`排队满时处理 (${t('overflowAction')})`}>
                       <select 
                         className="input-field" 
                         value={aiSettings.call_overflow_action || 'transfer'} 
@@ -1367,29 +1382,48 @@ function App() {
                     </InputGroup>
                   </div>
 
-                  {/* Wait Queue Settings */}
-                  <div className="space-y-4 pt-4 border-t border-slate-800">
-                    <h3 className="text-sm font-medium text-slate-300">Wait Queue Configuration</h3>
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      <InputGroup label={t('waitMessage')}>
-                        <textarea 
-                          className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 min-h-[60px] resize-y block" 
-                          value={aiSettings.wait_message || ''} 
-                          onChange={(e) => updateSetting('ai_settings', 'wait_message', e.target.value)} 
-                          placeholder="All lines are currently busy, please hold on."
-                        />
-                      </InputGroup>
-                      <InputGroup label={t('waitMusicUrl')}>
-                        <input 
-                          className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 block" 
-                          value={aiSettings.wait_music_url || ''} 
-                          onChange={(e) => updateSetting('ai_settings', 'wait_music_url', e.target.value)} 
-                          placeholder="Leave blank for default Twilio Music or enter MP3 URL..."
-                        />
-                      </InputGroup>
-                    </div>
-                  </div>
-                </Card>
+                      {/* Wait Queue Settings — redesigned */}
+                      <div className="space-y-4 pt-4 border-t border-slate-800">
+                        <h3 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
+                          <ListOrdered size={15} className="text-amber-400" />
+                          📞 电话排队系统配置
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                          <InputGroup label="最大排队人数" helpText="超过此人数按上方策略处理">
+                            <input
+                              className="input-field"
+                              type="number" min="1" max="20"
+                              value={aiSettings.max_queue_size ?? 5}
+                              onChange={(e) => updateSetting('ai_settings', 'max_queue_size', parseInt(e.target.value, 10))}
+                            />
+                          </InputGroup>
+                          <InputGroup label="等待超时自动转人工（秒）" helpText="超出后自动转接，默认100秒">
+                            <input
+                              className="input-field"
+                              type="number" min="30" max="600"
+                              value={aiSettings.queue_timeout_seconds ?? 100}
+                              onChange={(e) => updateSetting('ai_settings', 'queue_timeout_seconds', parseInt(e.target.value, 10))}
+                            />
+                          </InputGroup>
+                        </div>
+                        <InputGroup label="排队提示语音 (TTS)" helpText="来电进入排队时，Polly.Amy 朗读此内容，然后播放等待音乐">
+                          <textarea
+                            className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 min-h-[60px] resize-y block"
+                            value={aiSettings.wait_message || ''}
+                            onChange={(e) => updateSetting('ai_settings', 'wait_message', e.target.value)}
+                            placeholder="All lines are currently busy, please hold on."
+                          />
+                        </InputGroup>
+                        <InputGroup label="等待音乐链接（MP3 URL）" helpText="留空使用 Twilio 默认古典音乐；或输入任意公网 MP3 链接自定义">
+                          <input
+                            className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 block"
+                            value={aiSettings.wait_music_url || ''}
+                            onChange={(e) => updateSetting('ai_settings', 'wait_music_url', e.target.value)}
+                            placeholder="留空 = Twilio 默认音乐，或填入 .mp3 链接"
+                          />
+                        </InputGroup>
+                      </div>
+                    </Card>
 
                 <Card title={t('modelSpecs')}>
                    <div className="space-y-4">
