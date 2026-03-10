@@ -440,7 +440,8 @@ function App() {
           setActiveCallCount(msg.data.active_count);
           setActiveCallsList(msg.data.active_calls || {});
           
-          // Auto-switch view to the new call and clear old transcripts
+          // Clear old receipt + transcripts when a NEW call starts
+          setLiveOrder(null);
           setActiveViewCallSid(msg.data.call_sid);
           setTranscripts([{ id: Date.now(), role: 'system', text: `Call started from ${msg.data.caller_name || msg.data.caller}`, is_final: true, call_sid: msg.data.call_sid }]);
           
@@ -632,12 +633,7 @@ function App() {
     }
   };
 
-  useEffect(() => {
-    // Clear the live receipt automatically when the call ends
-    if (activeCallCount === 0) {
-      setLiveOrder(null);
-    }
-  }, [activeCallCount]);
+  // liveOrder persists until next call starts (cleared in call_start handler below)
 
   const handleSaveDeliveryArea = async () => {
     try {
