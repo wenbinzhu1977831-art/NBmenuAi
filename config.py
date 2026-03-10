@@ -306,8 +306,8 @@ class AppConfig:
                     # --- AI 运行设置 ---
                     ai = data.get('ai_settings', {})
                     self.master_switch = ai.get('master_switch', self.master_switch)
-                    self.max_queue_size = int(ai.get('max_queue_size', self.max_queue_size))
-                    self.queue_timeout_seconds = int(ai.get('queue_timeout_seconds', self.queue_timeout_seconds))
+                    self.max_queue_size = int(ai.get('max_queue_size') or self.max_queue_size)
+                    self.queue_timeout_seconds = int(ai.get('queue_timeout_seconds') or self.queue_timeout_seconds)
                     self.call_overflow_action = ai.get('call_overflow_action', self.call_overflow_action)
                     self.wait_message = ai.get('wait_message', self.wait_message)
                     self.wait_music_url = ai.get('wait_music_url', self.wait_music_url)
