@@ -2221,8 +2221,11 @@ async def handle_media_stream(websocket: WebSocket):
 
         finally:
             # ★ 草稿订单救援：若通话在 end_call 前意外断开，自动保存未完成订单
-            if not order_finalized and stream_call_sid:
+            # 注意：stream_call_sid 可能为 None（如 Gemini 在 Twilio START 前就崩了）
+            if not order_finalized:
                 try:
+                    # 如果 Gemini 在 START 之前就失败了，生成一个临时 SID
+                    rescue_sid = stream_call_sid or f"ERROR-{int(time.time())}"
                     rescue_id = f"ORD-INCOMPLETE-{int(time.time())}-{str(uuid.uuid4())[:4]}"
                     rescue_record = {
                         "order_id": rescue_id,
