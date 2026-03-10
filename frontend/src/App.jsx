@@ -908,11 +908,11 @@ function App() {
 
         {/* Dynamic Content Scroll Area */}
         <div className="flex-1 overflow-y-auto p-8 bg-gradient-to-br from-slate-950 to-slate-900">
-          <div className="max-w-5xl mx-auto h-full">
+          <div className="h-full">
 
             {/* ---- TAB: CUSTOMERS ---- */}
             {activeTab === 'customers' && (
-              <div className="h-full flex flex-col bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl">
+              <div className="max-w-5xl mx-auto h-full flex flex-col bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl">
                 <div className="px-6 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-800/50 shrink-0">
                   <h2 className="text-lg font-semibold text-white flex items-center gap-2">
                     <Users className="text-indigo-400" />
@@ -991,7 +991,7 @@ function App() {
               ];
 
               return (
-                <div className="h-full flex flex-col bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl">
+                <div className="max-w-5xl mx-auto h-full flex flex-col bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl">
                   <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/50 shrink-0">
                     <h2 className="text-lg font-semibold text-white flex items-center gap-2">
                       <BarChart2 className="text-indigo-400" />
@@ -1059,7 +1059,7 @@ function App() {
 
             {/* ---- TAB: HISTORY ORDERS ---- */}
             {activeTab === 'history' && (
-              <div className="h-full flex flex-col bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl">
+              <div className="max-w-5xl mx-auto h-full flex flex-col bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-2xl">
                 <div className="px-6 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-800/50 shrink-0">
                   <h2 className="text-lg font-semibold text-white flex items-center gap-2">
                     {selectedOrder ? (
@@ -1084,8 +1084,7 @@ function App() {
 
             {/* ---- TAB: DASHBOARD ---- */}
             {activeTab === 'dashboard' && (
-              <div className="-mx-8 w-[calc(100%+4rem)] h-full">
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full pb-4 px-8">
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full pb-4">
                  {/* Left Column: Stats & Operations (Span 3 now - smaller and more left) */}
                  <div className="lg:col-span-3 space-y-3 flex flex-col overflow-y-auto right-pane-scrollbar">
                     {/* Wait Queue Visual Display */}
@@ -1289,13 +1288,12 @@ function App() {
                    </div>
                  </div>
               </div>
-              </div>
             )}
 
             {/* ---- TAB: AI BRAIN ---- */}
             {activeTab === 'ai' && (
               sysRole !== 'admin' ? <LockedView t={t} /> :
-              <div className="space-y-6">
+              <div className="max-w-5xl mx-auto space-y-6">
                 <Card title={t('masterSwitch')}>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
                     <RadioOption 
@@ -1515,8 +1513,8 @@ function App() {
                   </div>
                 </Card>
                 
-                {/* Menu Database — full-width bleed: breaks out of max-w-5xl */}
-                <div className="mt-8 -mx-8 w-[calc(100%+4rem)]">
+                {/* Menu Database — full width (no max-w constraint at this level) */}
+                <div className="mt-8">
                   <MenuGUI />
                 </div>
               </div>
@@ -1526,7 +1524,7 @@ function App() {
             {/* ---- TAB: CONFIG ---- */}
             {activeTab === 'config' && (
               sysRole !== 'admin' ? <LockedView t={t} /> :
-              <div className="space-y-6">
+              <div className="max-w-5xl mx-auto space-y-6">
 
                 <Card title={t('apiKeys')}>
                   <div className="space-y-4">
