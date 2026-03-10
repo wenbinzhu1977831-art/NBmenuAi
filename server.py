@@ -2270,11 +2270,11 @@ async def handle_media_stream(websocket: WebSocket):
             # --- Wait Queue 解锁机制 ---
             global global_ai_busy, waiting_calls
             global_ai_busy = False # 释放 AI 接线员锁定状态
-            background_tasks.add_task(broadcast_admin, "ai_status", {"busy": False})
+            await broadcast_admin("ai_status", {"busy": False})  # 直接 await，WebSocket 无 background_tasks
             
             # 从等待队列中移除本已经建立过实际通话的号（防止幽灵排队）
             waiting_calls = [c for c in waiting_calls if c["number"] != customer_number]
-            background_tasks.add_task(broadcast_admin, "queue_update", waiting_calls)
+            await broadcast_admin("queue_update", waiting_calls)
 
 
 async def send_setup_message(
@@ -2419,7 +2419,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
         
     # 上锁：Web RTC 霸占 AI 线
     global_ai_busy = True
-    background_tasks.add_task(broadcast_admin, "ai_status", {"busy": True})
+    await broadcast_admin("ai_status", {"busy": True})  # 直接 await，WebSocket 无 background_tasks
 
     try:
         # --- 等待前端发送 start 事件 ---
