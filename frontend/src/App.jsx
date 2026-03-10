@@ -1437,6 +1437,11 @@ function App() {
             {activeTab === 'menu' && (
               sysRole !== 'admin' ? <LockedView t={t} /> :
               <div className="space-y-6">
+                {/* Menu Database — full width, placed at the TOP */}
+                <div>
+                  <MenuGUI />
+                </div>
+
                 <Card title={t('pricingRules')}>
                   <div className="grid grid-cols-2 gap-6">
                     <InputGroup label={t('minDel')}>
@@ -1514,10 +1519,6 @@ function App() {
                   </div>
                 </Card>
                 
-                {/* Menu Database — full width (no max-w constraint at this level) */}
-                <div className="mt-8">
-                  <MenuGUI />
-                </div>
               </div>
             )}
 
