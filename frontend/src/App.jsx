@@ -7,7 +7,7 @@ import {
   BarChart2, Lock, LogOut, PhoneForwarded
 } from 'lucide-react';
 import CodeEditor from './components/CodeEditor';
-import MenuEditor from './components/MenuEditor';
+
 import MenuGUI from './components/MenuGUI';
 import WebCallSimulator from './components/WebCallSimulator';
 import {
@@ -1513,26 +1513,10 @@ function App() {
                   </div>
                 </Card>
                 
-                {/* [NEW] The Online Menu Editor Space */}
-                <div className="flex items-center justify-between mt-8 mb-2">
-                  <h3 className="text-lg font-medium text-white">Menu Database</h3>
-                  <div className="flex bg-slate-800 rounded-lg p-1">
-                    <button 
-                      onClick={() => setMenuViewMode('gui')}
-                      className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${menuViewMode === 'gui' ? 'bg-indigo-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'}`}
-                    >
-                      Interactive GUI
-                    </button>
-                    <button 
-                      onClick={() => setMenuViewMode('raw')}
-                      className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${menuViewMode === 'raw' ? 'bg-slate-950 text-indigo-400 shadow border border-slate-700' : 'text-slate-400 hover:text-slate-200'}`}
-                    >
-                      RAW JSON
-                    </button>
-                  </div>
+                {/* Menu Database — new full-featured UI */}
+                <div className="mt-8">
+                  <MenuGUI />
                 </div>
-                
-                {menuViewMode === 'gui' ? <MenuGUI t={t} /> : <MenuEditor t={t} />}
               </div>
             )}
 
