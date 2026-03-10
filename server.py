@@ -2318,8 +2318,7 @@ async def send_setup_message(
                         "prebuiltVoiceConfig": {
                             "voiceName": config.voice_name
                         }
-                    },
-                    "languageCodes": ["en-US"]
+                    }
                 }
                 # "thinkingConfig" was removed here. Google's default thinking behavior will be restored, making the AI smarter.
             },
