@@ -1084,7 +1084,8 @@ function App() {
 
             {/* ---- TAB: DASHBOARD ---- */}
             {activeTab === 'dashboard' && (
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full pb-4">
+              <div className="-mx-8 w-[calc(100%+4rem)] h-full">
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full pb-4 px-8">
                  {/* Left Column: Stats & Operations (Span 3 now - smaller and more left) */}
                  <div className="lg:col-span-3 space-y-3 flex flex-col overflow-y-auto right-pane-scrollbar">
                     {/* Wait Queue Visual Display */}
@@ -1287,6 +1288,7 @@ function App() {
                        <LiveReceipt liveOrder={liveOrder} activeCallCount={activeCallCount} lang={lang} />
                    </div>
                  </div>
+              </div>
               </div>
             )}
 
