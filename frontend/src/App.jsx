@@ -1175,13 +1175,6 @@ function App() {
                        <h3 className="text-lg font-medium text-white flex items-center gap-2">
                          <Terminal size={18} className="text-emerald-400" />
                          {lang === 'zh' ? '实时对话记录终端' : 'Live Transcript Terminal'}
-                         <button
-                           onClick={handleClearLogs}
-                           className="ml-4 px-2 py-0.5 text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
-                           title="Clear server.log"
-                         >
-                           {lang === 'zh' ? '清空日志' : 'Clear Logs'}
-                         </button>
                        </h3>
                       {activeCallCount > 0 && <span className="flex h-3 w-3 relative">
                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
