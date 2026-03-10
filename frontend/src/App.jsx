@@ -1513,8 +1513,8 @@ function App() {
                   </div>
                 </Card>
                 
-                {/* Menu Database — new full-featured UI */}
-                <div className="mt-8">
+                {/* Menu Database — full-width bleed: breaks out of max-w-5xl */}
+                <div className="mt-8 -mx-8 w-[calc(100%+4rem)]">
                   <MenuGUI />
                 </div>
               </div>
