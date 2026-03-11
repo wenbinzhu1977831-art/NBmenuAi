@@ -2261,6 +2261,7 @@ async def send_setup_message(
            - responseModalities: ["AUDIO"] — 仅输出音频，减少文本处理延迟
            - speechConfig.voiceConfig：指定 TTS 语音（如 Aoede）
         3. inputAudioTranscription: {} — 启用用户语音实时转录功能
+           4. outputAudioTranscription: {} — 启用 AI 语音输出转录（AI 说了什么的文字版本）
         4. systemInstruction：AI 的系统提示词（人设、规则、菜单、客户信息）
         5. tools：注册可供 AI 调用的工具函数列表
 
@@ -2290,8 +2291,11 @@ async def send_setup_message(
                 }
                 # "thinkingConfig" was removed here. Google's default thinking behavior will be restored, making the AI smarter.
             },
-            # 恢复用户语音实时转录（与 mid-call 1008 无关，该字段支持此模型）
+            # 启用用户语音实时转录（STT → inputTranscription 事件）
             "inputAudioTranscription": {},
+            # 启用 AI 语音输出转录（AI 说了什么 → outputTranscription 事件）
+            # 这样管理面板可以实时显示 AI 所说内容的文字版本
+            "outputAudioTranscription": {},
             "systemInstruction": {
                 "parts": [{"text": base_instruction}]
             },
