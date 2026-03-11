@@ -439,11 +439,8 @@ function App() {
         } else if (msg.event === 'call_start') {
           setActiveCallCount(msg.data.active_count);
           setActiveCallsList(msg.data.active_calls || {});
-          
-          // Clear old receipt + transcripts when a NEW call starts
-          setLiveOrder(null);
+          // 不立刻清空小票和转写 — 等新通话的第一条转写到达再清
           setActiveViewCallSid(msg.data.call_sid);
-          setTranscripts([{ id: Date.now(), role: 'system', text: `Call started from ${msg.data.caller_name || msg.data.caller}`, is_final: true, call_sid: msg.data.call_sid }]);
           
         } else if (msg.event === 'call_end') {
           setActiveCallCount(msg.data.active_count);
@@ -452,9 +449,16 @@ function App() {
         } else if (msg.event === 'transcript') {
           setTranscripts(prev => {
              const { role, text, is_final, call_sid } = msg.data;
-             // If we receive a transcript for a call we aren't looking at, and we are looking at nothing, auto-switch
-             setActiveViewCallSid(current => current ? current : call_sid);
-             
+             // If we receive a transcript for a call we aren't looking at, auto-switch
+             setActiveViewCallSid(current => {
+               if (!current) return call_sid;
+               // New call_sid means a fresh call started — clear old receipt and transcripts
+               if (current !== call_sid) {
+                 setLiveOrder(null);
+                 return call_sid;
+               }
+               return current;
+             });
              const newTranscripts = [...prev];
              
              if (role === 'user' && !is_final) {

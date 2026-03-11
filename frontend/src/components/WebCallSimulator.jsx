@@ -15,7 +15,7 @@ const WebCallSimulator = ({ t, aiBusy }) => {
   const isCallingRef = useRef(false);
   
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const currentToken = localStorage.getItem('admin_token') || '';
+  const currentToken = localStorage.getItem('sys_token') || '';
   const tokenParam = currentToken ? `?token=${currentToken}` : '';
   const API_URL_WS = window.location.host.includes('localhost:5173') 
     ? `ws://localhost:5000/api/admin/web_call${tokenParam}`
