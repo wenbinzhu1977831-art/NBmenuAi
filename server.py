@@ -1618,12 +1618,28 @@ async def queue_check(request: Request):
     logger.info(f"[Queue-Check] 当前状态: {status}, 号码: {caller.get('number')}")
     
     if status == "connecting":
-        # AI 已空闲且已标记接通 → 立即跳转到 /incoming-call 接入 AI
-        logger.info(f"[Queue-Check] ✅ 状态为 connecting，立即接通 AI: {caller.get('number')}")
-        return Response(
-            content=f"<Response><Redirect method=\"POST\">https://{host}/incoming-call</Redirect></Response>",
-            media_type="application/xml"
-        )
+        # AI 已空闲且已标记接通 → 直接返回 Connect+Stream TwiML，跳过 /incoming-call 重定向
+        # （Twilio 在轮询上下文中不总是遵循 <Redirect>，直接返回 TwiML 更可靠）
+        global global_ai_busy, waiting_calls
+        
+        logger.info(f"[Queue-Check] ✅ 状态为 connecting，直接返回 Stream TwiML 接通 AI: {caller.get('number')}")
+        
+        # 锁定 AI（此调用会立刻接待这通电话）
+        global_ai_busy = True
+        await broadcast_admin("ai_status", {"busy": True})
+        
+        # 注意：caller 记录保持 "connecting" 状态，
+        # media-stream 的 finally 块会将其更新为 "completed"
+        
+        twiml = f"""<Response>
+    <Connect>
+        <Stream url="wss://{host}/media-stream">
+            <Parameter name="customer_number" value="{caller_number}" />
+        </Stream>
+    </Connect>
+    <Redirect method="POST">https://{host}/stream-ended</Redirect>
+</Response>"""
+        return Response(content=twiml, media_type="application/xml")
     
     elif status == "auto_transferred":
         # 已超时转人工
@@ -1638,13 +1654,13 @@ async def queue_check(request: Request):
         )
     
     elif status in ("waiting",):
-        # 仍在等待 → 再播一段音乐，然后再次轮询
+        # 仍在等待 → 再播一段音乐，然后再次轮询（用绝对路径避免相对路径解析问题）
         wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
         logger.info(f"[Queue-Check] ⏳ 状态为 waiting，继续播放等待音乐: {caller.get('number')}")
         return Response(
             content=f"""<Response>
                 <Play>{wait_music}</Play>
-                <Redirect method="POST">/queue-check</Redirect>
+                <Redirect method="POST">https://{host}/queue-check</Redirect>
             </Response>""",
             media_type="application/xml"
         )
