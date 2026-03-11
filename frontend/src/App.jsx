@@ -69,18 +69,29 @@ const translations = {
     bypassHelp: "Played right before transferring.",
     offlineMessage: "Offline Message (TTS voice)",
     offlineHelp: "Played right before hanging up. Leave blank to reject call immediately without answering.",
-    waitMessage: "Wait Queue Message (TTS)",
-    waitMusicUrl: "Wait Queue Music URL",
-    waitQueueTitle: "Waiting Queue",
+    waitQueueTitle: "Incoming Call Info",
     minWait: "min wait",
     transferBtn: "Transfer to Human",
     transferSuccess: "Transfer initiated to human agent.",
     transferFailed: "Failed to transfer customer. They might have hung up.",
-    maxCalls: "Max Concurrent AI Calls",
-    maxCallsHelp: "Limit the number of simultaneous active calls.",
-    overflowAction: "When Limit Exceeded",
-    overflowTransfer: "Transfer to Human",
-    overflowReject: "Play Busy & Hang Up",
+    maxCalls: "Max Concurrent Calls",
+    maxCallsHelp: "Calls exceeding this limit will be rejected.",
+    concurrentCallsTitle: "Concurrent Call Limits",
+    busyMessageLabel: "Busy Message (TTS)",
+    busyMessageHelp: "Leave blank = direct busy tone (no answer); fill in = answer, play TTS, then hang up.",
+    busyMessagePlaceholder: "Leave blank = busy tone; fill in = TTS then hang up",
+    noCallLog: "No incoming calls yet",
+    callLogMoreFmt: "Showing latest 20 of {n} total",
+    linesSuffix: "lines",
+    callActive: "🟢 Active",
+    callCompleted: "⚫ Ended",
+    callMissed: "🔴 Missed",
+    tooltipWebrtc: "WebRTC Browser Call",
+    tooltipTwilio: "Twilio Phone Call",
+    tooltipOrderDone: "Order completed",
+    tooltipOrderMissed: "Call ended without order",
+    tooltipNoOrder: "No order placed",
+    tooltipTransferred: "Transferred to human",
     modelSpecs: "Model Specifications",
     geminiModel: "Gemini Model",
     voicePersonality: "Voice Personality",
@@ -209,16 +220,29 @@ const translations = {
     offlineHelp: "挂断电话前播放。如果留空，系统将直接拒接来电以节省 Twilio 通话费。",
     waitMessage: "排队提示语音 (TTS)",
     waitMusicUrl: "排队等待音乐链接 (MP3)",
-    waitQueueTitle: "电话排队区",
+    waitQueueTitle: "电话呼入信息区",
     minWait: "分钟等待",
     transferBtn: "转接人工客服",
     transferSuccess: "已成功下达转接指令。",
     transferFailed: "转接失败，该用户可能已挂断。",
-    maxCalls: "最大 AI 并发接单数",
-    maxCallsHelp: "限制同时进行的人工智能接听数量（防止 API 超过配额）。",
-    overflowAction: "超出并发限制时处理",
-    overflowTransfer: "排队提示并转接人工",
-    overflowReject: "播放繁忙提示并挂断",
+    maxCalls: "最大并发通话数",
+    maxCallsHelp: "超过此数量的来电将被拒绝。",
+    concurrentCallsTitle: "并发通话限制",
+    busyMessageLabel: "繁忙话术 (TTS)",
+    busyMessageHelp: "留空 = 直接忙音拒接（不接通）；填内容 = 接通后 TTS 播报内容再挂断。",
+    busyMessagePlaceholder: "留空 = 直接忙音（不接通）；填内容 = TTS 播报后挂断",
+    noCallLog: "暂无呼入记录",
+    callLogMoreFmt: "仅显示最新20条，共{n}条",
+    linesSuffix: "路",
+    callActive: "🟢 进行中",
+    callCompleted: "⚫ 已结束",
+    callMissed: "🔴 未接通",
+    tooltipWebrtc: "WebRTC 网页通话",
+    tooltipTwilio: "Twilio 电话",
+    tooltipOrderDone: "订单已完成",
+    tooltipOrderMissed: "通话结束未完成订单",
+    tooltipNoOrder: "未下单",
+    tooltipTransferred: "已转人工",
     modelSpecs: "模型参数配置",
     geminiModel: "Gemini 语音大模型",
     voicePersonality: "语音音色性格",
@@ -330,8 +354,6 @@ function App() {
   const [dashboardStats, setDashboardStats] = useState(null); // The historical trend stats
   const [liveOrder, setLiveOrder] = useState(null); // Real-time order data being built
   const [aiBusy, setAiBusy] = useState(false);
-  const [callLog, setCallLog] = useState([]);  // 呼入日志列表（替代原 waitQueue）
-  const [maxConcurrent, setMaxConcurrent] = useState(3); // 当前配置的并发上限
 
   // Orders Modal States
   const [showOrdersModal, setShowOrdersModal] = useState(false);
@@ -778,24 +800,8 @@ function App() {
     }
   };
 
-  const handleTransferQueue = async (callSid) => {
-    if (sysRole !== 'admin') {
-      showNotification(t('unauthorized'), 'error');
-      return;
-    }
-    setTransferringSid(callSid);
-    try {
-      const res = await axios.post(`${API_URL}/queue/transfer`, { call_sid: callSid });
-      if (res.data.status === 'success') {
-        showNotification(t('transferSuccess'), 'success');
-      }
-    } catch (error) {
-      console.error('Transfer failed:', error);
-      showNotification(t('transferFailed'), 'error');
-    } finally {
-      setTransferringSid(null);
-    }
-  };
+  // 呼入日志（替代原 waitQueue）
+  const [callLog, setCallLog] = useState([]);
 
   const updateSetting = (category, key, value) => {
     setSettings(prev => ({
@@ -1097,9 +1103,9 @@ function App() {
 
                       const SRC_ICON      = { twilio: '📱', webrtc: '🖥️' };
                       const STATUS_CFG    = {
-                        active:    { label: '🟢 进行中',   cls: 'text-emerald-400 bg-emerald-500/10 border-emerald-700/40' },
-                        completed: { label: '⚫ 已结束',   cls: 'text-slate-400  bg-slate-700/20   border-slate-700/30'  },
-                        missed:    { label: '🔴 未接通',   cls: 'text-red-400   bg-red-500/10     border-red-700/40'    },
+                        active:    { label: t('callActive'),    cls: 'text-emerald-400 bg-emerald-500/10 border-emerald-700/40' },
+                        completed: { label: t('callCompleted'), cls: 'text-slate-400  bg-slate-700/20   border-slate-700/30'  },
+                        missed:    { label: t('callMissed'),    cls: 'text-red-400   bg-red-500/10     border-red-700/40'    },
                       };
 
                       return (
@@ -1108,14 +1114,14 @@ function App() {
                           <div className="flex items-center justify-between mb-2">
                             <h3 className="text-sm font-medium text-slate-400 flex items-center gap-1.5">
                               <PhoneIncoming size={14} className="text-green-400" />
-                              电话呼入信息区
+                              {t('waitQueueTitle')}
                             </h3>
                             <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
                               activeCount >= maxCalls
                                 ? 'bg-red-500/20 text-red-300 border border-red-700/40'
                                 : 'bg-emerald-500/10 text-emerald-400 border border-emerald-700/30'
                             }`}>
-                              {activeCount} / {maxCalls} 路
+                              {activeCount} / {maxCalls} {t('linesSuffix')}
                             </span>
                           </div>
                           {/* Capacity bar */}
@@ -1140,29 +1146,29 @@ function App() {
                                 <div key={idx} className={`flex items-center gap-2 p-2 rounded-lg border bg-slate-950 border-slate-800 text-[11px] ${
                                   log.status === 'active' ? 'ring-1 ring-emerald-500/30' : 'opacity-75'
                                 }`}>
-                                  <span title={log.source === 'webrtc' ? 'WebRTC 网页通话' : 'Twilio 电话'}>{srcIcon}</span>
+                                  <span title={log.source === 'webrtc' ? t('tooltipWebrtc') : t('tooltipTwilio')}>{srcIcon}</span>
                                   <span className="font-mono text-slate-300 flex-1 truncate">{log.number}</span>
                                   <span className="text-slate-600">{callTime}</span>
                                   {log.ended_at && <span className="text-slate-600">{duration}</span>}
                                   <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium whitespace-nowrap ${cfg.cls}`}>{cfg.label}</span>
                                   {/* Order outcome */}
                                   {log.status === 'completed' && (
-                                    <span title={log.order_finalized === true ? '订单已完成' : log.order_finalized === false ? '订单未完成' : '未下单'}>
+                                    <span title={log.order_finalized === true ? t('tooltipOrderDone') : log.order_finalized === false ? t('tooltipOrderMissed') : t('tooltipNoOrder')}>
                                       {log.order_finalized === true ? '✅' : log.order_finalized === false ? '⚠️' : '—'}
                                     </span>
                                   )}
                                   {/* Transfer indicator */}
-                                  {log.transferred && <span title="已转人工">🔀</span>}
+                                  {log.transferred && <span title={t('tooltipTransferred')}>🔀</span>}
                                 </div>
                               );
                             }) : (
                               <div className="flex flex-col items-center justify-center text-slate-600 space-y-2 py-6">
                                 <Coffee size={18} className="opacity-40" />
-                                <span className="text-xs">暂无呼入记录</span>
+                                <span className="text-xs">{t('noCallLog')}</span>
                               </div>
                             )}
                             {callLog.length > 20 && (
-                              <p className="text-center text-[10px] text-slate-600 pt-1">↑ 仅显示最新20条，共{callLog.length}条</p>
+                              <p className="text-center text-[10px] text-slate-600 pt-1">{t('callLogMoreFmt').replace('{n}', callLog.length)}</p>
                             )}
                           </div>
                         </div>
@@ -1392,10 +1398,10 @@ function App() {
                   <div className="space-y-4 pt-4 border-t border-slate-800">
                     <h3 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
                       <PhoneIncoming size={15} className="text-green-400" />
-                      📞 并发通话限制
+                      📞 {t('concurrentCallsTitle')}
                     </h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      <InputGroup label="最大并发通话数" helpText="超过此数量的来电将被拒绝">
+                      <InputGroup label={t('maxCalls')} helpText={t('maxCallsHelp')}>
                         <input
                           className="input-field"
                           type="number" min="1" max="10"
@@ -1405,14 +1411,14 @@ function App() {
                       </InputGroup>
                     </div>
                     <InputGroup
-                      label="繁忙话术 (busy_message)"
-                      helpText="留空 = 直接忙音拒接（不接通）；填内容 = 接通后 TTS 播报内容再挂断"
+                      label={t('busyMessageLabel')}
+                      helpText={t('busyMessageHelp')}
                     >
                       <textarea
                         className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 min-h-[60px] resize-y block"
                         value={aiSettings.busy_message || ''}
                         onChange={(e) => updateSetting('ai_settings', 'busy_message', e.target.value)}
-                        placeholder="留空 = 直接忙音（不接通）；填内容 = TTS 播报后挂断"
+                        placeholder={t('busyMessagePlaceholder')}
                       />
                     </InputGroup>
                   </div>
