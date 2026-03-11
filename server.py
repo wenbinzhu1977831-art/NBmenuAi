@@ -471,10 +471,11 @@ async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: s
 
 async def dequeue_next_caller():
     """
-    AI 通话结束后，通过 Twilio Queue Members REST API 将排队首位来电接入 AI。
+    AI 通话结束后，将排队中的下一个来电直接重定向到 /incoming-call。
     
-    使用 Twilio 原生的 Enqueue/Dequeue 机制，完全避免了更新 in-progress 通话的 REST API 调用（后者对
-    Play 状态的通话一直返回 404）。Enqueued 状态的成员完全支持 Members API 出队操作。
+    使用 Twilio Update Call REST API (POST /Calls/{CallSid})，
+    通过内联 TwiML 将 in-progress 来电重定向到 /incoming-call。
+    这种方式绕过了 Enqueue Members API 的 404 问题。
     """
     next_c = next((c for c in waiting_calls if c["status"] == "waiting"), None)
     if not next_c:
@@ -483,30 +484,68 @@ async def dequeue_next_caller():
     if task and not task.done():
         task.cancel()
     next_c["status"] = "connecting"
-    logger.info(f"[Queue] 将来电 {next_c['number']} (CallSid={next_c['call_sid']}, QueueSid={next_c.get('twilio_queue_sid','??')}) 出队到 /incoming-call")
-    
+    call_sid = next_c["call_sid"]
     host = next_c.get("host", "")
-    if not host:
-        logger.error("[Queue] dequeue 失败: waiting_calls 中没有 host 信息")
+    account_sid = next_c.get("account_sid", "")
+    logger.info(f"[Queue] 重定向来电 {next_c['number']} (CallSid={call_sid}) → /incoming-call")
+
+    if not host or not account_sid:
+        logger.error("[Queue] dequeue 失败: 缺少 host 或 account_sid")
         next_c["status"] = "waiting"
+        await broadcast_admin("queue_update", safe_queue())
         return
-    
-    incoming_url = f"https://{host}/incoming-call"
-    # 使用来电实际入队的 QueueSid（从 /queue-wait-music 回调中获得）
-    ok = await twilio_dequeue_member(
-        next_c["account_sid"],
-        url=incoming_url,
-        call_sid=next_c["call_sid"],
-        queue_sid=next_c.get("twilio_queue_sid")  # 实际 QueueSid，非 REST API 查找结果
-    )
-    if not ok:
-        logger.error(f"[Queue] 出队失败，回滚状态为 waiting")
+
+    auth_account = config.twilio_account_sid or account_sid
+    auth_token = config.twilio_auth_token
+    if not auth_token:
+        logger.error("[Queue] dequeue 失败: TWILIO_AUTH_TOKEN 未配置")
         next_c["status"] = "waiting"
+        await broadcast_admin("queue_update", safe_queue())
+        return
+
+    # 方法1：通过 Update Call API 将 in-progress 来电重定向
+    update_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Calls/{call_sid}.json"
+    redirect_twiml = f"""<Response><Redirect method="POST">https://{host}/incoming-call</Redirect></Response>"""
+
+    logger.info(f"[Queue] Update Call: POST {update_url}")
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                update_url,
+                data={"Twiml": redirect_twiml},
+                auth=(auth_account, auth_token),
+                timeout=5.0
+            )
+        if resp.status_code >= 400:
+            logger.error(f"[Queue] Update Call 失败 ({resp.status_code}): {resp.text}")
+            # 如果 Update Call 失败，尝试 Members API 作为备用
+            logger.info("[Queue] 尝试 Members API 备用方案...")
+            twilio_queue_sid = next_c.get("twilio_queue_sid")
+            if twilio_queue_sid:
+                ok = await twilio_dequeue_member(
+                    account_sid=account_sid,
+                    url=f"https://{host}/incoming-call",
+                    call_sid=call_sid,
+                    queue_sid=twilio_queue_sid
+                )
+                if ok:
+                    logger.info("[Queue] Members API 备用成功")
+                    await broadcast_admin("queue_update", safe_queue())
+                    return
+            logger.error("[Queue] 所有出队方法失败，回滚状态为 waiting")
+            next_c["status"] = "waiting"
+        else:
+            logger.info(f"[Queue] Update Call 成功 ({resp.status_code}): 来电已重定向到 /incoming-call")
+    except Exception as e:
+        logger.error(f"[Queue] Update Call 异常: {e}")
+        next_c["status"] = "waiting"
+
     await broadcast_admin("queue_update", safe_queue())
 
 
-
 # =============================================================================
+
 # 双层权限认证系统 (Admin vs Staff)
 # =============================================================================
 
