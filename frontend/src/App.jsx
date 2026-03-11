@@ -1761,8 +1761,8 @@ function AutoScrollTrigger({ transcripts }) {
 // 辅助组件：实时订单小票 (Live Receipt) 覆盖在 Dashboard 右侧
 // ----------------------------------------------------------------------
 function LiveReceipt({ liveOrder, activeCallCount, lang }) {
-  if (activeCallCount === 0) {
-    // 待机状态
+  // 待机状态：无通话 且 无小票数据时才显示等待占位
+  if (activeCallCount === 0 && !liveOrder) {
     return (
       <Card className="flex-1 h-full min-h-[400px] flex items-center justify-center" title={lang === 'zh' ? '实时订单追踪' : 'Live Order Receipt'}>
         <div className="text-slate-500 flex flex-col items-center gap-3 w-full h-full justify-center opacity-60">
