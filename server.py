@@ -1599,6 +1599,7 @@ async def queue_check(request: Request):
     ★ 这个机制完全避免了通过 Twilio REST API 强制更新 in-progress 通话
       （REST API 更新 Play 状态的通话会返回 404，是 Twilio 的已知限制）。
     """
+    global global_ai_busy, waiting_calls  # 在函数顶部声明，避免 Python prior-use 语法错误
     form_data = await request.form()
     call_sid = form_data.get("CallSid", "Unknown")
     caller_number = form_data.get("From", "Unknown")
@@ -1620,7 +1621,6 @@ async def queue_check(request: Request):
     if status == "connecting":
         # AI 已空闲且已标记接通 → 直接返回 Connect+Stream TwiML，跳过 /incoming-call 重定向
         # （Twilio 在轮询上下文中不总是遵循 <Redirect>，直接返回 TwiML 更可靠）
-        global global_ai_busy, waiting_calls
         
         logger.info(f"[Queue-Check] ✅ 状态为 connecting，直接返回 Stream TwiML 接通 AI: {caller.get('number')}")
         
