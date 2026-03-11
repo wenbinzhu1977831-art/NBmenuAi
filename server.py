@@ -347,33 +347,98 @@ async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: s
 
 
 TWILIO_QUEUE_NAME = "AIQueue"  # Twilio 原生队列名称
+_twilio_queue_sid: str | None = None  # 缓存队列 SID，避免每次出队时重复查询
+
+
+async def _get_or_create_queue_sid(auth_account: str, auth_token: str):
+    """
+    获取（并缓存）AIQueue 的 Twilio Queue SID（QUxxx 格式）。
+    
+    Twilio Queue Members REST API 只接受 Queue SID 作为路径参数，
+    不接受 FriendlyName，因此必须先通过 FriendlyName 查询到 SID。
+    结果会被缓存到 _twilio_queue_sid 全局变量中。
+    """
+    global _twilio_queue_sid
+    if _twilio_queue_sid:
+        return _twilio_queue_sid
+    
+    import httpx
+    list_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues.json"
+    try:
+        # 先尝试按 FriendlyName 查找已存在的队列
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                list_url,
+                params={"FriendlyName": TWILIO_QUEUE_NAME},
+                auth=(auth_account, auth_token),
+                timeout=5.0
+            )
+        if resp.status_code == 200:
+            queues = resp.json().get("queues", [])
+            if queues:
+                _twilio_queue_sid = queues[0]["sid"]
+                logger.info(f"[Queue] 找到已存在队列 SID: {_twilio_queue_sid}")
+                return _twilio_queue_sid
+        
+        # 队列不存在，创建新队列
+        logger.info(f"[Queue] 队列 '{TWILIO_QUEUE_NAME}' 不存在，正在创建...")
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                list_url,
+                data={"FriendlyName": TWILIO_QUEUE_NAME, "MaxSize": 100},
+                auth=(auth_account, auth_token),
+                timeout=5.0
+            )
+        if resp.status_code in (200, 201):
+            _twilio_queue_sid = resp.json()["sid"]
+            logger.info(f"[Queue] 新队列创建成功，SID: {_twilio_queue_sid}")
+            return _twilio_queue_sid
+        else:
+            logger.error(f"[Queue] 创建队列失败 ({resp.status_code}): {resp.text}")
+            return None
+    except Exception as e:
+        logger.error(f"[Queue] 获取队列 SID 异常: {e}")
+        return None
 
 
 async def twilio_dequeue_member(account_sid: str, url: str, method: str = "POST") -> bool:
     """
-    通过 Twilio REST API 将队列首位的成员退出队列并轮换到指定 URL。
+    将队首成员退出队列并轮换到指定 URL。
     
-    这是 Enqueue 机制中最可靠的出队方式——对 Enqueued 状态的通话完全有效，
-    不像更新 in-progress call (Play 状态) 一直 404 的问题。
+    ★ 正确的 API 路径:
+       POST /Accounts/{AccountSid}/Queues/{QueueSid}/Members/Front.json
+       QueueSid 是 QU 开头的 SID，不能是 FriendlyName!
     """
     auth_account = config.twilio_account_sid or account_sid
     auth_token = config.twilio_auth_token
     if not auth_token:
         logger.error("twilio_dequeue_member: TWILIO_AUTH_TOKEN 未配置")
         return False
-    queue_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues/{TWILIO_QUEUE_NAME}.json/Members/Front.json"
-    logger.info(f"[Queue] 出队请求: POST {queue_url}, url={url}")
+    
+    # 第一步：获取正确的 Queue SID
+    queue_sid = await _get_or_create_queue_sid(auth_account, auth_token)
+    if not queue_sid:
+        logger.error("[Queue] 无法获取 Queue SID，出队取消")
+        return False
+    
+    # 第二步：用真实 SID 调用 Members API
+    members_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues/{queue_sid}/Members/Front.json"
+    logger.info(f"[Queue] 出队请求: POST {members_url}, Url={url}")
+    
+    import httpx
     try:
-        import httpx
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                queue_url,
+                members_url,
                 data={"Url": url, "Method": method},
                 auth=(auth_account, auth_token),
                 timeout=5.0
             )
         if resp.status_code >= 400:
             logger.error(f"[Queue] 出队失败 ({resp.status_code}): {resp.text}")
+            if resp.status_code == 404:
+                global _twilio_queue_sid
+                _twilio_queue_sid = None  # 清除缓存，下次重新查询
             return False
         else:
             logger.info(f"[Queue] 出队成功 ({resp.status_code})")
