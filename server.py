@@ -476,12 +476,14 @@ async def admin_websocket(websocket: WebSocket, token: str = None):
     await websocket.accept()
     ADMIN_CLIENTS.add(websocket)
 
-    # --- 发送初始同步数据：当前活跃通话状态 ---
+    # --- 发送初始同步数据：当前活跃通话状态 + 队列 + AI 状态 ---
     await websocket.send_text(json.dumps({
         "event": "sync",
         "data": {
             "active_calls_count": len(ACTIVE_CALLS),
-            "active_calls": ACTIVE_CALLS  # 完整字典，含每个通话的详细信息
+            "active_calls": ACTIVE_CALLS,
+            "ai_status": {"busy": global_ai_busy},
+            "queue_update": safe_queue()
         }
     }))
 
