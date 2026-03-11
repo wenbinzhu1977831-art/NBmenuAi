@@ -401,15 +401,12 @@ async def _get_or_create_queue_sid(auth_account: str, auth_token: str):
         return None
 
 
-async def twilio_dequeue_member(account_sid: str, url: str, call_sid: str = "Front", method: str = "POST") -> bool:
+async def twilio_dequeue_member(account_sid: str, url: str, call_sid: str = "Front", queue_sid: str | None = None, method: str = "POST") -> bool:
     """
     将队列中指定成员退出队列并执行指定 URL。
     
-    ★ 正确的 API 路径:
-       POST /Accounts/{AccountSid}/Queues/{QueueSid}/Members/{CallSid}.json
-       
-       call_sid 传入具体的来电 SID（CAyyy...）而不是 "Front"。
-       用具体 CallSid 可避免 "Front" 因 Twilio 队列异步而产生的 404。
+    queue_sid: 传入调用者记录中存储的实际 QueueSid（避免 REST API 查找返回错误的队列）
+    call_sid: 使用具体的来电 SID，避免 "Front" 的竞态 404
     """
     auth_account = config.twilio_account_sid or account_sid
     auth_token = config.twilio_auth_token
@@ -417,13 +414,13 @@ async def twilio_dequeue_member(account_sid: str, url: str, call_sid: str = "Fro
         logger.error("twilio_dequeue_member: TWILIO_AUTH_TOKEN 未配置")
         return False
     
-    # 第一步：获取正确的 Queue SID
-    queue_sid = await _get_or_create_queue_sid(auth_account, auth_token)
+    # 优先使用调用者存储的实际 QueueSid（最可靠），如果没有则走 REST API 查找途径
+    if not queue_sid:
+        queue_sid = await _get_or_create_queue_sid(auth_account, auth_token)
     if not queue_sid:
         logger.error("[Queue] 无法获取 Queue SID，出队取消")
         return False
     
-    # 第二步：用具体 CallSid 调用 Members API（避免用 Front 可能的竞态 404）
     members_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues/{queue_sid}/Members/{call_sid}.json"
     logger.info(f"[Queue] 出队请求: POST {members_url}, Url={url}")
     
@@ -456,14 +453,18 @@ async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: s
     caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
     if caller and caller["status"] == "waiting":
         caller["status"] = "auto_transferred"
-        logger.info(f"[Queue] {number} 等待超时 ({config.queue_timeout_seconds}s)，通过 Members/{call_sid} 自动转人工")
+        logger.info(f"[Queue] {number} 超时转人工, QueueSid={caller.get('twilio_queue_sid','??')}")
         host = caller.get("host", "")
         if host:
             transfer_url = f"https://{host}/queue-transfer"
-            # 使用具体 CallSid 出队，避免 Front 的竞态 404
-            await twilio_dequeue_member(account_sid, url=transfer_url, call_sid=call_sid)
+            await twilio_dequeue_member(
+                account_sid,
+                url=transfer_url,
+                call_sid=call_sid,
+                queue_sid=caller.get("twilio_queue_sid")
+            )
         else:
-            logger.error(f"[Queue] auto_transfer 失败: waiting_calls 中没有 host 信息")
+            logger.error(f"[Queue] auto_transfer 失败: 没有 host")
         await broadcast_admin("queue_update", safe_queue())
 
 
@@ -482,7 +483,7 @@ async def dequeue_next_caller():
     if task and not task.done():
         task.cancel()
     next_c["status"] = "connecting"
-    logger.info(f"[Queue] 通过 Members/{next_c['call_sid']} 将来电 {next_c['number']} 引导到 /incoming-call")
+    logger.info(f"[Queue] 将来电 {next_c['number']} (CallSid={next_c['call_sid']}, QueueSid={next_c.get('twilio_queue_sid','??')}) 出队到 /incoming-call")
     
     host = next_c.get("host", "")
     if not host:
@@ -491,10 +492,15 @@ async def dequeue_next_caller():
         return
     
     incoming_url = f"https://{host}/incoming-call"
-    # 关键修复: 传入具体 CallSid，不用 "Front" 避免竞态 404
-    ok = await twilio_dequeue_member(next_c["account_sid"], url=incoming_url, call_sid=next_c["call_sid"])
+    # 使用来电实际入队的 QueueSid（从 /queue-wait-music 回调中获得）
+    ok = await twilio_dequeue_member(
+        next_c["account_sid"],
+        url=incoming_url,
+        call_sid=next_c["call_sid"],
+        queue_sid=next_c.get("twilio_queue_sid")  # 实际 QueueSid，非 REST API 查找结果
+    )
     if not ok:
-        logger.error(f"[Queue] Members/{next_c['call_sid']} 失败，回滚状态为 waiting")
+        logger.error(f"[Queue] 出队失败，回滚状态为 waiting")
         next_c["status"] = "waiting"
     await broadcast_admin("queue_update", safe_queue())
 
@@ -1728,10 +1734,30 @@ async def queue_wait_music(request: Request):
     """
     Twilio Enqueue 的 waitUrl 端点。
     
-    当来电在队列中等待时，Twilio 会持续 GET 此 URL 获取等待音乐 TwiML。
-    Twilio 自动循环播放，无需服务器轮询。
-    此端点只需返回音乐 TwiML，不涉及任何状态管理逻辑。
+    关键：Twilio 调用此 URL 时会传入 QueueSid 和 CallSid 参数。
+    我们利用这个机会记录**Twilio 实际用到的队列 SID**，避免后续出队时用错队列。
     """
+    # 从 Twilio 传入的参数中获取实际的队列 SID 和 CallSid
+    twilio_queue_sid = request.query_params.get("QueueSid", "")
+    twilio_call_sid = request.query_params.get("CallSid", "")
+    
+    if twilio_queue_sid and twilio_call_sid:
+        # 更新 waiting_calls 中对应记录，存入 Twilio 实际用的 QueueSid
+        caller = next((c for c in waiting_calls if c["call_sid"] == twilio_call_sid), None)
+        if caller:
+            if caller.get("twilio_queue_sid") != twilio_queue_sid:
+                # 首次获取到，或者发生变化，记录并日志
+                old = caller.get("twilio_queue_sid", "None")
+                caller["twilio_queue_sid"] = twilio_queue_sid
+                logger.info(f"[Queue] 等待音乐 CallSid={twilio_call_sid}: 实际 QueueSid={twilio_queue_sid} (覆盖旧={old})")
+        else:
+            # 记录 QueueSid 到全局缓存，以防 waiting_calls 还未导入
+            logger.info(f"[Queue] /queue-wait-music: 未找到 CallSid={twilio_call_sid} 的记录，将 QueueSid={twilio_queue_sid} 存入缓存")
+            # 尝试用 QueueSid 更新全局 SID 缓存（以便删除错误的一个）
+            global _twilio_queue_sid
+            if _twilio_queue_sid != twilio_queue_sid:
+                logger.warning(f"[Queue] 发现 QueueSid 键大！好队列={twilio_queue_sid} vs 缓存={_twilio_queue_sid}")
+    
     wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
     twiml = f"""<Response>
     <Play>{wait_music}</Play>
