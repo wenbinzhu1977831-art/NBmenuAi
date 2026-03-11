@@ -329,9 +329,9 @@ function App() {
   const [incompleteOrders, setIncompleteOrders] = useState(0); // 今日草稿/断线订单数
   const [dashboardStats, setDashboardStats] = useState(null); // The historical trend stats
   const [liveOrder, setLiveOrder] = useState(null); // Real-time order data being built
-  const [aiBusy, setAiBusy] = useState(false); // Global cross-platform wait queue lock
-  const [waitQueue, setWaitQueue] = useState([]); // List of active callers in Twilio Enqueue loop
-  const [transferringSid, setTransferringSid] = useState(null); // Which call_sid is currently being transferred
+  const [aiBusy, setAiBusy] = useState(false);
+  const [callLog, setCallLog] = useState([]);  // 呼入日志列表（替代原 waitQueue）
+  const [maxConcurrent, setMaxConcurrent] = useState(3); // 当前配置的并发上限
 
   // Orders Modal States
   const [showOrdersModal, setShowOrdersModal] = useState(false);
@@ -428,7 +428,7 @@ function App() {
           if (msg.data.total_orders !== undefined) setTotalOrders(msg.data.total_orders);
           if (msg.data.incomplete_orders !== undefined) setIncompleteOrders(msg.data.incomplete_orders);
           if (msg.data.ai_status !== undefined) setAiBusy(msg.data.ai_status.busy);
-          if (msg.data.queue_update !== undefined) setWaitQueue(msg.data.queue_update);
+          if (msg.data.call_log !== undefined) setCallLog(msg.data.call_log);
         } else if (msg.event === 'new_order') {
           if (msg.data && msg.data.total_orders !== undefined) {
              setTotalOrders(msg.data.total_orders);
@@ -510,8 +510,8 @@ function App() {
           });
         } else if (msg.event === 'ai_status') {
           setAiBusy(msg.data.busy);
-        } else if (msg.event === 'queue_update') {
-          setWaitQueue(msg.data);
+        } else if (msg.event === 'call_log_update') {
+          setCallLog(msg.data || []);
         } else if (msg.event === 'system_log') {
           setTranscripts(prev => [...prev, { id: Date.now() + Math.random(), role: 'system_log', text: msg.data.message, type: msg.data.type || 'info', call_sid: msg.data.call_sid }]);
         } else if (msg.event === 'tool_call') {
@@ -1088,72 +1088,87 @@ function App() {
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 h-full pb-4">
                  {/* Left Column: Stats & Operations (Span 3 now - smaller and more left) */}
                  <div className="lg:col-span-3 space-y-3 flex flex-col overflow-y-auto right-pane-scrollbar">
-                    {/* Wait Queue Visual Display — 6-state redesign */}
+                    {/* 呼入日志卡片区 */}
                     {(() => {
-                      const waitingCount = waitQueue?.filter(c => c.status === 'waiting').length || 0;
-                      const sortedQueue = [...(waitQueue || [])].reverse().slice(0, 10);
-                      const STATUS_CFG = {
-                        waiting:            { label: '⏳ 等待中',     cls: 'text-amber-400 bg-amber-500/10 border-amber-700/40' },
-                        connecting:         { label: '✅ AI接通中',   cls: 'text-emerald-400 bg-emerald-500/10 border-emerald-700/40' },
-                        completed:          { label: '📞 通话完毕',   cls: 'text-slate-400 bg-slate-700/20 border-slate-700/30' },
-                        auto_transferred:   { label: '🔀 已自动转接', cls: 'text-blue-400 bg-blue-500/10 border-blue-700/40' },
-                        manual_transferred: { label: '👤 手动接听',   cls: 'text-green-400 bg-green-500/10 border-green-700/40' },
-                        hung_up:            { label: '❌ 已挂断',     cls: 'text-slate-500 bg-slate-800/30 border-slate-700/20' },
+                      const activeCalls   = callLog.filter(r => r.status === 'active');
+                      const activeCount   = activeCalls.length;
+                      const maxCalls      = aiSettings?.max_concurrent_calls ?? 3;
+                      const recentLog     = [...callLog].reverse().slice(0, 20);
+
+                      const SRC_ICON      = { twilio: '📱', webrtc: '🖥️' };
+                      const STATUS_CFG    = {
+                        active:    { label: '🟢 进行中',   cls: 'text-emerald-400 bg-emerald-500/10 border-emerald-700/40' },
+                        completed: { label: '⚫ 已结束',   cls: 'text-slate-400  bg-slate-700/20   border-slate-700/30'  },
+                        missed:    { label: '🔴 未接通',   cls: 'text-red-400   bg-red-500/10     border-red-700/40'    },
                       };
+
                       return (
-                        <div className={`border rounded-xl p-3 flex flex-col ${waitingCount > 0 ? 'bg-amber-950/20 border-amber-900/50' : 'bg-slate-900 border-slate-800'}`}>
-                          <h3 className={`text-sm font-medium mb-2 flex items-center justify-between ${waitingCount > 0 ? 'text-amber-400' : 'text-slate-400'}`}>
-                            <span className="flex items-center gap-1.5"><ListOrdered size={14}/> {t('waitQueueTitle')}</span>
-                            {waitingCount > 0 && <span className="bg-amber-500/20 text-amber-300 px-2 py-0.5 rounded-full text-[10px] font-bold">{waitingCount} Waiting</span>}
-                          </h3>
-                          <div className="overflow-y-auto max-h-[250px] pr-1 space-y-1.5">
-                            {sortedQueue.length > 0 ? sortedQueue.map((caller, idx) => {
-                              const cfg = STATUS_CFG[caller.status] || STATUS_CFG.hung_up;
-                              const isTerminal = caller.status !== 'waiting';
-                              const callTime = new Date(caller.joined_at * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
-                              const isTransferring = transferringSid === caller.call_sid;
+                        <div className="border rounded-xl p-3 flex flex-col bg-slate-900 border-slate-800">
+                          {/* Header: title + concurrent progress bar */}
+                          <div className="flex items-center justify-between mb-2">
+                            <h3 className="text-sm font-medium text-slate-400 flex items-center gap-1.5">
+                              <PhoneIncoming size={14} className="text-green-400" />
+                              电话呼入信息区
+                            </h3>
+                            <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
+                              activeCount >= maxCalls
+                                ? 'bg-red-500/20 text-red-300 border border-red-700/40'
+                                : 'bg-emerald-500/10 text-emerald-400 border border-emerald-700/30'
+                            }`}>
+                              {activeCount} / {maxCalls} 路
+                            </span>
+                          </div>
+                          {/* Capacity bar */}
+                          <div className="w-full h-1 bg-slate-800 rounded-full mb-3">
+                            <div
+                              className={`h-full rounded-full transition-all ${
+                                activeCount >= maxCalls ? 'bg-red-500' : 'bg-emerald-500'
+                              }`}
+                              style={{ width: `${Math.min((activeCount / maxCalls) * 100, 100)}%` }}
+                            />
+                          </div>
+                          {/* Call cards */}
+                          <div className="overflow-y-auto max-h-[260px] pr-1 space-y-1.5">
+                            {recentLog.length > 0 ? recentLog.map((log, idx) => {
+                              const cfg      = STATUS_CFG[log.status] || STATUS_CFG.missed;
+                              const srcIcon  = SRC_ICON[log.source] || '📞';
+                              const callTime = new Date(log.joined_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+                              const duration = log.ended_at
+                                ? Math.round(log.ended_at - log.joined_at) + 's'
+                                : '–';
                               return (
-                                <div key={idx} className={`flex items-center justify-between p-2 rounded-lg border text-[11px] ${isTerminal ? 'opacity-60' : ''} ${caller.status === 'waiting' ? 'bg-slate-950' : 'bg-slate-900/50'} border-slate-800`}>
-                                  <span className="font-mono text-slate-300 tracking-wider shrink-0">{caller.number}</span>
-                                  <span className="text-slate-500 mx-2 shrink-0">{callTime}</span>
-                                  <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium shrink-0 ${cfg.cls}`}>{cfg.label}</span>
-                                  {/* 点单标记 */}
-                                  {caller.status === 'completed' && caller.order_finalized !== null && caller.order_finalized !== undefined && (
-                                    <span className="ml-1 shrink-0" title={caller.order_finalized ? '订单已完成' : '未完成点单'}>
-                                      {caller.order_finalized ? '🟢' : '🟠'}
+                                <div key={idx} className={`flex items-center gap-2 p-2 rounded-lg border bg-slate-950 border-slate-800 text-[11px] ${
+                                  log.status === 'active' ? 'ring-1 ring-emerald-500/30' : 'opacity-75'
+                                }`}>
+                                  <span title={log.source === 'webrtc' ? 'WebRTC 网页通话' : 'Twilio 电话'}>{srcIcon}</span>
+                                  <span className="font-mono text-slate-300 flex-1 truncate">{log.number}</span>
+                                  <span className="text-slate-600">{callTime}</span>
+                                  {log.ended_at && <span className="text-slate-600">{duration}</span>}
+                                  <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium whitespace-nowrap ${cfg.cls}`}>{cfg.label}</span>
+                                  {/* Order outcome */}
+                                  {log.status === 'completed' && (
+                                    <span title={log.order_finalized === true ? '订单已完成' : log.order_finalized === false ? '订单未完成' : '未下单'}>
+                                      {log.order_finalized === true ? '✅' : log.order_finalized === false ? '⚠️' : '—'}
                                     </span>
                                   )}
-                                  {/* 操作按钮：仅 waiting 状态 + admin */}
-                                  {!isTerminal && sysRole === 'admin' && (
-                                    <div className="flex items-center gap-1 ml-1 shrink-0">
-                                      {!aiBusy && (
-                                        <button
-                                          onClick={async () => { try { await axios.post(`${API_URL}/queue/connect/${caller.call_sid}`); } catch(e) { showNotification('接通失败', 'error'); }}}
-                                          className="p-1 rounded text-emerald-400 hover:bg-emerald-500/10 transition" title="让 AI 立即接通"
-                                        ><PhoneIncoming size={13}/></button>
-                                      )}
-                                      <button
-                                        onClick={() => handleTransferQueue(caller.call_sid)}
-                                        disabled={isTransferring}
-                                        className={`p-1 rounded transition ${isTransferring ? 'text-slate-500' : 'text-blue-400 hover:bg-blue-500/10'}`} title="转接人工"
-                                      ><PhoneForwarded size={13} className={isTransferring ? 'animate-spin' : ''}/></button>
-                                    </div>
-                                  )}
+                                  {/* Transfer indicator */}
+                                  {log.transferred && <span title="已转人工">🔀</span>}
                                 </div>
                               );
                             }) : (
                               <div className="flex flex-col items-center justify-center text-slate-600 space-y-2 py-6">
                                 <Coffee size={18} className="opacity-40" />
-                                <span className="text-xs">Queue is empty</span>
+                                <span className="text-xs">暂无呼入记录</span>
                               </div>
                             )}
-                            {(waitQueue?.length || 0) > 10 && (
-                              <p className="text-center text-[10px] text-slate-600 pt-1">↑ 仅显示最新10条，共{waitQueue.length}条</p>
+                            {callLog.length > 20 && (
+                              <p className="text-center text-[10px] text-slate-600 pt-1">↑ 仅显示最新20条，共{callLog.length}条</p>
                             )}
                           </div>
                         </div>
                       );
                     })()}
+
 
                     <DashboardCard 
                       title={t('aiCallsActive')} 
@@ -1373,61 +1388,36 @@ function App() {
                     </div>
                   </div>
 
-                  <div className="pt-4 border-t border-slate-800">
-                    <InputGroup label={`排队满时处理 (${t('overflowAction')})`}>
-                      <select 
-                        className="input-field" 
-                        value={aiSettings.call_overflow_action || 'transfer'} 
-                        onChange={(e) => updateSetting('ai_settings', 'call_overflow_action', e.target.value)}
-                      >
-                        <option value="transfer">{t('overflowTransfer')}</option>
-                        <option value="reject">{t('overflowReject')}</option>
-                      </select>
+                  {/* 并发通话上限配置 */}
+                  <div className="space-y-4 pt-4 border-t border-slate-800">
+                    <h3 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
+                      <PhoneIncoming size={15} className="text-green-400" />
+                      📞 并发通话限制
+                    </h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <InputGroup label="最大并发通话数" helpText="超过此数量的来电将被拒绝">
+                        <input
+                          className="input-field"
+                          type="number" min="1" max="10"
+                          value={aiSettings.max_concurrent_calls ?? 3}
+                          onChange={(e) => updateSetting('ai_settings', 'max_concurrent_calls', parseInt(e.target.value, 10))}
+                        />
+                      </InputGroup>
+                    </div>
+                    <InputGroup
+                      label="繁忙话术 (busy_message)"
+                      helpText="留空 = 直接忙音拒接（不接通）；填内容 = 接通后 TTS 播报内容再挂断"
+                    >
+                      <textarea
+                        className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 min-h-[60px] resize-y block"
+                        value={aiSettings.busy_message || ''}
+                        onChange={(e) => updateSetting('ai_settings', 'busy_message', e.target.value)}
+                        placeholder="留空 = 直接忙音（不接通）；填内容 = TTS 播报后挂断"
+                      />
                     </InputGroup>
                   </div>
+                </Card>
 
-                      {/* Wait Queue Settings — redesigned */}
-                      <div className="space-y-4 pt-4 border-t border-slate-800">
-                        <h3 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
-                          <ListOrdered size={15} className="text-amber-400" />
-                          📞 电话排队系统配置
-                        </h3>
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                          <InputGroup label="最大排队人数" helpText="超过此人数按上方策略处理">
-                            <input
-                              className="input-field"
-                              type="number" min="1" max="20"
-                              value={aiSettings.max_queue_size ?? 5}
-                              onChange={(e) => updateSetting('ai_settings', 'max_queue_size', parseInt(e.target.value, 10))}
-                            />
-                          </InputGroup>
-                          <InputGroup label="等待超时自动转人工（秒）" helpText="超出后自动转接，默认100秒">
-                            <input
-                              className="input-field"
-                              type="number" min="30" max="600"
-                              value={aiSettings.queue_timeout_seconds ?? 100}
-                              onChange={(e) => updateSetting('ai_settings', 'queue_timeout_seconds', parseInt(e.target.value, 10))}
-                            />
-                          </InputGroup>
-                        </div>
-                        <InputGroup label="排队提示语音 (TTS)" helpText="来电进入排队时，Polly.Amy 朗读此内容，然后播放等待音乐">
-                          <textarea
-                            className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 min-h-[60px] resize-y block"
-                            value={aiSettings.wait_message || ''}
-                            onChange={(e) => updateSetting('ai_settings', 'wait_message', e.target.value)}
-                            placeholder="All lines are currently busy, please hold on."
-                          />
-                        </InputGroup>
-                        <InputGroup label="等待音乐链接（MP3 URL）" helpText="留空使用 Twilio 默认古典音乐；或输入任意公网 MP3 链接自定义">
-                          <input
-                            className="w-full p-3 bg-slate-950 border border-slate-700 rounded-lg text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 block"
-                            value={aiSettings.wait_music_url || ''}
-                            onChange={(e) => updateSetting('ai_settings', 'wait_music_url', e.target.value)}
-                            placeholder="留空 = Twilio 默认音乐，或填入 .mp3 链接"
-                          />
-                        </InputGroup>
-                      </div>
-                    </Card>
 
                 <Card title={t('modelSpecs')}>
                    <div className="space-y-4">
