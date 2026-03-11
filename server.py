@@ -401,13 +401,15 @@ async def _get_or_create_queue_sid(auth_account: str, auth_token: str):
         return None
 
 
-async def twilio_dequeue_member(account_sid: str, url: str, method: str = "POST") -> bool:
+async def twilio_dequeue_member(account_sid: str, url: str, call_sid: str = "Front", method: str = "POST") -> bool:
     """
-    将队首成员退出队列并轮换到指定 URL。
+    将队列中指定成员退出队列并执行指定 URL。
     
     ★ 正确的 API 路径:
-       POST /Accounts/{AccountSid}/Queues/{QueueSid}/Members/Front.json
-       QueueSid 是 QU 开头的 SID，不能是 FriendlyName!
+       POST /Accounts/{AccountSid}/Queues/{QueueSid}/Members/{CallSid}.json
+       
+       call_sid 传入具体的来电 SID（CAyyy...）而不是 "Front"。
+       用具体 CallSid 可避免 "Front" 因 Twilio 队列异步而产生的 404。
     """
     auth_account = config.twilio_account_sid or account_sid
     auth_token = config.twilio_auth_token
@@ -421,8 +423,8 @@ async def twilio_dequeue_member(account_sid: str, url: str, method: str = "POST"
         logger.error("[Queue] 无法获取 Queue SID，出队取消")
         return False
     
-    # 第二步：用真实 SID 调用 Members API
-    members_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues/{queue_sid}/Members/Front.json"
+    # 第二步：用具体 CallSid 调用 Members API（避免用 Front 可能的竞态 404）
+    members_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues/{queue_sid}/Members/{call_sid}.json"
     logger.info(f"[Queue] 出队请求: POST {members_url}, Url={url}")
     
     import httpx
@@ -449,18 +451,17 @@ async def twilio_dequeue_member(account_sid: str, url: str, method: str = "POST"
 
 
 async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: str):
-    """等待 queue_timeout_seconds 秒后，将仍在 waiting 状态的来电自动转人工。
-    通过 Twilio Queue Members API 实现——对 Enqueued 通话完全有效。
-    """
+    """等待 queue_timeout_seconds 秒后，将仍在 waiting 状态的来电自动转人工。"""
     await asyncio.sleep(config.queue_timeout_seconds)
     caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
     if caller and caller["status"] == "waiting":
         caller["status"] = "auto_transferred"
-        logger.info(f"[Queue] {number} 等待超时 ({config.queue_timeout_seconds}s)，通过 Members API 自动转人工")
+        logger.info(f"[Queue] {number} 等待超时 ({config.queue_timeout_seconds}s)，通过 Members/{call_sid} 自动转人工")
         host = caller.get("host", "")
         if host:
             transfer_url = f"https://{host}/queue-transfer"
-            await twilio_dequeue_member(account_sid, url=transfer_url)
+            # 使用具体 CallSid 出队，避免 Front 的竞态 404
+            await twilio_dequeue_member(account_sid, url=transfer_url, call_sid=call_sid)
         else:
             logger.error(f"[Queue] auto_transfer 失败: waiting_calls 中没有 host 信息")
         await broadcast_admin("queue_update", safe_queue())
@@ -481,11 +482,8 @@ async def dequeue_next_caller():
     if task and not task.done():
         task.cancel()
     next_c["status"] = "connecting"
-    logger.info(f"[Queue] 通过 Members API 将来电 {next_c['number']} 引导到 /incoming-call")
+    logger.info(f"[Queue] 通过 Members/{next_c['call_sid']} 将来电 {next_c['number']} 引导到 /incoming-call")
     
-    # 通过 Members API 将 Enqueued 通话退出队列，重新执行 /incoming-call TwiML
-    # 注意：这里的 URL 会被 Twilio 调用，所以必须是完整的公网 HTTPS URL
-    # 我们存储待接通信息，当 /incoming-call 收到请求时会正常处理
     host = next_c.get("host", "")
     if not host:
         logger.error("[Queue] dequeue 失败: waiting_calls 中没有 host 信息")
@@ -493,9 +491,10 @@ async def dequeue_next_caller():
         return
     
     incoming_url = f"https://{host}/incoming-call"
-    ok = await twilio_dequeue_member(next_c["account_sid"], url=incoming_url)
+    # 关键修复: 传入具体 CallSid，不用 "Front" 避免竞态 404
+    ok = await twilio_dequeue_member(next_c["account_sid"], url=incoming_url, call_sid=next_c["call_sid"])
     if not ok:
-        logger.error(f"[Queue] Members API 失败，回滚状态为 waiting")
+        logger.error(f"[Queue] Members/{next_c['call_sid']} 失败，回滚状态为 waiting")
         next_c["status"] = "waiting"
     await broadcast_admin("queue_update", safe_queue())
 
