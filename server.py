@@ -346,11 +346,68 @@ async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: s
 
 
 
-async def dequeue_next_caller():
-    """AI 通话结束后，标记排队中第一个 waiting 状态的来电为 connecting。
+TWILIO_QUEUE_NAME = "AIQueue"  # Twilio 原生队列名称
+
+
+async def twilio_dequeue_member(account_sid: str, url: str, method: str = "POST") -> bool:
+    """
+    通过 Twilio REST API 将队列首位的成员退出队列并轮换到指定 URL。
     
-    该来电会在下次轮询 /queue-check 时自动检测到状态变化并直接连入 AI。
-    此方法替代了不可靠的 twilio_redirect REST API 调用（后者在 Play 状态下一直返回 404）。
+    这是 Enqueue 机制中最可靠的出队方式——对 Enqueued 状态的通话完全有效，
+    不像更新 in-progress call (Play 状态) 一直 404 的问题。
+    """
+    auth_account = config.twilio_account_sid or account_sid
+    auth_token = config.twilio_auth_token
+    if not auth_token:
+        logger.error("twilio_dequeue_member: TWILIO_AUTH_TOKEN 未配置")
+        return False
+    queue_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues/{TWILIO_QUEUE_NAME}.json/Members/Front.json"
+    logger.info(f"[Queue] 出队请求: POST {queue_url}, url={url}")
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                queue_url,
+                data={"Url": url, "Method": method},
+                auth=(auth_account, auth_token),
+                timeout=5.0
+            )
+        if resp.status_code >= 400:
+            logger.error(f"[Queue] 出队失败 ({resp.status_code}): {resp.text}")
+            return False
+        else:
+            logger.info(f"[Queue] 出队成功 ({resp.status_code})")
+            return True
+    except Exception as e:
+        logger.error(f"[Queue] 出队异常: {e}")
+        return False
+
+
+async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: str):
+    """等待 queue_timeout_seconds 秒后，将仍在 waiting 状态的来电自动转人工。
+    通过 Twilio Queue Members API 实现——对 Enqueued 通话完全有效。
+    """
+    await asyncio.sleep(config.queue_timeout_seconds)
+    caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
+    if caller and caller["status"] == "waiting":
+        caller["status"] = "auto_transferred"
+        logger.info(f"[Queue] {number} 等待超时 ({config.queue_timeout_seconds}s)，通过 Members API 自动转人工")
+        host = caller.get("host", "")
+        if host:
+            transfer_url = f"https://{host}/queue-transfer"
+            await twilio_dequeue_member(account_sid, url=transfer_url)
+        else:
+            logger.error(f"[Queue] auto_transfer 失败: waiting_calls 中没有 host 信息")
+        await broadcast_admin("queue_update", safe_queue())
+
+
+
+async def dequeue_next_caller():
+    """
+    AI 通话结束后，通过 Twilio Queue Members REST API 将排队首位来电接入 AI。
+    
+    使用 Twilio 原生的 Enqueue/Dequeue 机制，完全避免了更新 in-progress 通话的 REST API 调用（后者对
+    Play 状态的通话一直返回 404）。Enqueued 状态的成员完全支持 Members API 出队操作。
     """
     next_c = next((c for c in waiting_calls if c["status"] == "waiting"), None)
     if not next_c:
@@ -359,8 +416,24 @@ async def dequeue_next_caller():
     if task and not task.done():
         task.cancel()
     next_c["status"] = "connecting"
-    logger.info(f"[Queue] 已标记来电 {next_c['number']} 为 connecting，等待其下次轮询 /queue-check 时自动接通")
+    logger.info(f"[Queue] 通过 Members API 将来电 {next_c['number']} 引导到 /incoming-call")
+    
+    # 通过 Members API 将 Enqueued 通话退出队列，重新执行 /incoming-call TwiML
+    # 注意：这里的 URL 会被 Twilio 调用，所以必须是完整的公网 HTTPS URL
+    # 我们存储待接通信息，当 /incoming-call 收到请求时会正常处理
+    host = next_c.get("host", "")
+    if not host:
+        logger.error("[Queue] dequeue 失败: waiting_calls 中没有 host 信息")
+        next_c["status"] = "waiting"
+        return
+    
+    incoming_url = f"https://{host}/incoming-call"
+    ok = await twilio_dequeue_member(next_c["account_sid"], url=incoming_url)
+    if not ok:
+        logger.error(f"[Queue] Members API 失败，回滚状态为 waiting")
+        next_c["status"] = "waiting"
     await broadcast_admin("queue_update", safe_queue())
+
 
 
 # =============================================================================
@@ -1451,21 +1524,21 @@ async def incoming_call(request: Request, background_tasks: BackgroundTasks):
                 </Response>"""
             return Response(content=twiml, media_type="application/xml")
 
-        # 排队等待：播放一段音乐后 redirect 到 /queue-check 轮询点
-        # ★ 轮询机制替代 Play loop="0"，避免 REST API 无法中断 Play 状态的 404 问题
-        # Twilio 每次 <Play> 结束后会重新 POST /queue-check，服务器根据状态决定接通或继续等
-        logger.info(f"状态 [Queue]: 系统忙碌，号码 {caller_number} 进入排队等待。")
+        # 将来电加入 Twilio 原生队列 (Enqueue)
+        # ★ Enqueue 是正确和可靠的排队方式：
+        #   - Twilio 自动通过 waitUrl 播放等待音乐（自动循环）
+        #   - 出队通过 Members API (POST /Queues/QueueName/Members/Front)
+        #   - Enqueued 通话支持 Members API 操作，不会像 Play 状态一样 404
+        logger.info(f"状态 [Queue]: 系统忙碌，号码 {caller_number} 进入 Twilio 内建队列等待。")
         wait_msg = config.wait_message or "All lines are currently busy, please hold on."
-        wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
 
         twiml = f"""<Response>
             <Say voice="Polly.Amy">{wait_msg}</Say>
-            <Play>{wait_music}</Play>
-            <Redirect method="POST">/queue-check</Redirect>
+            <Enqueue waitUrl="https://{host}/queue-wait-music" waitUrlMethod="GET">{TWILIO_QUEUE_NAME}</Enqueue>
         </Response>"""
 
 
-        # 启动 100 秒自动转接倒计时
+        # 启动超时计时
         timeout_task = asyncio.create_task(
             auto_transfer_after_timeout(call_sid, account_sid, caller_number)
         )
@@ -1477,9 +1550,11 @@ async def incoming_call(request: Request, background_tasks: BackgroundTasks):
             "status":            "waiting",
             "order_finalized":   None,
             "auto_transfer_task": timeout_task,
+            "host":              host,  # 存储 host 供 dequeue_next_caller 使用
         })
         background_tasks.add_task(broadcast_admin, "queue_update", safe_queue())
         return Response(content=twiml, media_type="application/xml")
+
 
     # --- 路由判断 4：正常接待（active 模式）---
     # AI 空闲，上锁准备接通
@@ -1584,8 +1659,41 @@ async def stream_ended(request: Request):
     return Response(content=twiml, media_type="application/xml")
 
 
+@app.get("/queue-wait-music")
+async def queue_wait_music(request: Request):
+    """
+    Twilio Enqueue 的 waitUrl 端点。
+    
+    当来电在队列中等待时，Twilio 会持续 GET 此 URL 获取等待音乐 TwiML。
+    Twilio 自动循环播放，无需服务器轮询。
+    此端点只需返回音乐 TwiML，不涉及任何状态管理逻辑。
+    """
+    wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
+    twiml = f"""<Response>
+    <Play>{wait_music}</Play>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/queue-transfer")
+async def queue_transfer(request: Request):
+    """
+    超时转人工的出队目标 URL。
+    当 auto_transfer_after_timeout 触发时，Members API 会把排队电话路由到此 URL。
+    """
+    transfer_number = config.transfer_phone_number or ""
+    twiml = f"""<Response>
+    <Say voice="Polly.Amy">Sorry for the long wait, transferring you to a human agent now.</Say>
+    <Dial>{transfer_number}</Dial>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")
+
+
+
+
 @app.post("/queue-check")
 async def queue_check(request: Request):
+
     """
     排队状态轮询端点。
     
@@ -1619,17 +1727,13 @@ async def queue_check(request: Request):
     logger.info(f"[Queue-Check] 当前状态: {status}, 号码: {caller.get('number')}")
     
     if status == "connecting":
-        # AI 已空闲且已标记接通 → 直接返回 Connect+Stream TwiML，跳过 /incoming-call 重定向
-        # （Twilio 在轮询上下文中不总是遵循 <Redirect>，直接返回 TwiML 更可靠）
+        # AI 已空闲且已标记接通 → 直接返回 Connect+Stream TwiML
+        # （此分支秐存作备用，如果 Enqueue 失败可回退到此路径）
         
         logger.info(f"[Queue-Check] ✅ 状态为 connecting，直接返回 Stream TwiML 接通 AI: {caller.get('number')}")
         
-        # 锁定 AI（此调用会立刻接待这通电话）
-        global_ai_busy = True
-        await broadcast_admin("ai_status", {"busy": True})
-        
-        # 注意：caller 记录保持 "connecting" 状态，
-        # media-stream 的 finally 块会将其更新为 "completed"
+        # 注意：不在这里设置 global_ai_busy=True，避免 stream 未建立时状态卡死
+        # global_ai_busy 将在 /media-stream 连接事件触发后由 /incoming-call 设置
         
         twiml = f"""<Response>
     <Connect>
