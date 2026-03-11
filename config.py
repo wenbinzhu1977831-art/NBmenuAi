@@ -97,16 +97,15 @@ class AppConfig:
     #   "offline" — 离线模式，播放 offline_message 后挂断（或直接拒接）
     master_switch: str = "active"
 
-    # Wait Queue (防死锁并发排队)的自定义配置
-    wait_message: str = "All lines are currently busy, please hold on."
-    wait_music_url: str = "" # 空则默认播放 Twilio 的 Classical 音乐
-    max_queue_size: int = 5  # 最大排队人数（超过则按 call_overflow_action 处理）
-    queue_timeout_seconds: int = 100  # 自动转接超时秒数
+    # --- 并发通话配置 ---
 
-    # 排队满时或超时的处理策略：
-    #   "transfer" — 将排队来电转接给人工（推荐）
-    #   "reject"   — 播放繁忙提示后直接挂断
-    call_overflow_action: str = "transfer"
+    # 最大同时通话数（Twilio 电话 + WebRTC 网页通话共享此上限）
+    # 超过此数量的来电将被拒绝
+    max_concurrent_calls: int = 3
+
+    # 繁忙话术（留空 = 直接发送 Twilio 忙音 Reject，不接通、不消耗 TTS 费用）
+    # 有内容 = 接通后 TTS 播报该话术，再挂断
+    busy_message: str = "Sorry, all our lines are busy right now. Please try again in a few minutes."
 
     # Gemini 模型名称（通过 Google AI Studio 查看可用模型）
     # 目前使用支持实时语音的 native audio 模型
@@ -306,11 +305,8 @@ class AppConfig:
                     # --- AI 运行设置 ---
                     ai = data.get('ai_settings', {})
                     self.master_switch = ai.get('master_switch', self.master_switch)
-                    self.max_queue_size = int(ai.get('max_queue_size') or self.max_queue_size)
-                    self.queue_timeout_seconds = int(ai.get('queue_timeout_seconds') or self.queue_timeout_seconds)
-                    self.call_overflow_action = ai.get('call_overflow_action', self.call_overflow_action)
-                    self.wait_message = ai.get('wait_message', self.wait_message)
-                    self.wait_music_url = ai.get('wait_music_url', self.wait_music_url)
+                    self.max_concurrent_calls = int(ai.get('max_concurrent_calls') or self.max_concurrent_calls)
+                    self.busy_message = ai.get('busy_message', self.busy_message)
                     self.model_name = ai.get('model_name', self.model_name)
                     self.voice_name = ai.get('voice_name', self.voice_name)
                     self.temperature = ai.get('temperature', self.temperature)

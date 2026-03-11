@@ -226,13 +226,63 @@ CALL_STATES = {}
 #   2. 管理面板实时展示当前通话数量和详情
 ACTIVE_CALLS = {}
 
-# 电话排队等待全局锁与队列
-# 当 global_ai_busy 为 True 时，新进来的通话将进入等候室（良音乐循环）
-global_ai_busy = False
-# waiting_calls：每条记录包含:
-#   call_sid, account_sid, number, joined_at, status, order_finalized, auto_transfer_task
-# status 可取値: waiting / connecting / completed / auto_transferred / manual_transferred / hung_up
-waiting_calls = []
+# =============================================================================
+# 并发通话管理
+# =============================================================================
+
+# 呼入日志：记录每通电话的完整信息（最多保留 200 条）
+call_log: list = []
+CALL_LOG_MAX = 200
+
+# 数据库写操作锁：防止并发写入 JSON 文件造成数据损坏
+_db_write_lock = asyncio.Lock()
+
+
+def call_log_add(call_sid: str, number: str, source: str) -> dict:
+    """新增一条呼入记录，返回该记录。"""
+    record = {
+        "call_sid":        call_sid,
+        "number":          number,
+        "source":          source,
+        "joined_at":       time.time(),
+        "ended_at":        None,
+        "status":          "active",
+        "order_finalized": None,
+        "transferred":     False,
+    }
+    call_log.append(record)
+    if len(call_log) > CALL_LOG_MAX:
+        call_log.pop(0)
+    return record
+
+
+def call_log_end(call_sid: str, order_finalized=None,
+                 transferred: bool = False, missed: bool = False):
+    """标记通话结束，更新 call_log 中的对应记录。"""
+    for r in reversed(call_log):
+        if r["call_sid"] == call_sid:
+            r["ended_at"]        = time.time()
+            r["status"]          = "missed" if missed else "completed"
+            r["order_finalized"] = order_finalized
+            r["transferred"]     = transferred
+            break
+
+
+def safe_call_log() -> list:
+    """返回 call_log 的 JSON 安全副本。"""
+    return [
+        {
+            "call_sid":        r["call_sid"],
+            "number":          r["number"],
+            "source":          r["source"],
+            "joined_at":       r["joined_at"],
+            "ended_at":        r["ended_at"],
+            "status":          r["status"],
+            "order_finalized": r["order_finalized"],
+            "transferred":     r["transferred"],
+        }
+        for r in call_log
+    ]
 
 
 # =============================================================================
@@ -283,265 +333,6 @@ async def broadcast_admin(event: str, data: dict):
     # 清除已断开的客户端
     for ws in disconnected:
         ADMIN_CLIENTS.remove(ws)
-
-
-# =============================================================================
-# 电话排队系统 — 辅助函数
-# =============================================================================
-
-def safe_queue() -> list:
-    """将 waiting_calls 序列化为可 JSON 广播的格式（去除 asyncio.Task 对象）。"""
-    result = []
-    for c in waiting_calls:
-        result.append({
-            "call_sid":        c["call_sid"],
-            "number":          c["number"],
-            "joined_at":       c["joined_at"],
-            "status":          c["status"],
-            "order_finalized": c.get("order_finalized"),
-        })
-    return result
-
-
-async def twilio_redirect(call_sid: str, account_sid: str, twiml: str):
-    """通过 Twilio REST API 覆盖正在进行的通话的 TwiML 指令。
-    
-    account_sid: 来电时 Twilio POST 的 AccountSid，用于构建 URL（通话实际归属账户）
-    config.twilio_account_sid: 认证用的主账户 SID（用于 Basic Auth，可能与来电账户不同）
-    """
-    # ★ URL 路径用来电实际归属账户（避免跨账户 404）
-    call_owner_sid = account_sid
-    # 认证 SID：若配置了主账户则用主账户，否则退用来电账户
-    auth_account_sid = config.twilio_account_sid or account_sid
-    auth_token = config.twilio_auth_token
-    if not auth_token:
-        logger.error("twilio_redirect: TWILIO_AUTH_TOKEN 未配置，无法操作通话")
-        return
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{call_owner_sid}/Calls/{call_sid}.json"
-    logger.info(f"[Queue] twilio_redirect → CallSid={call_sid}, owner={call_owner_sid}, auth={auth_account_sid}")
-    try:
-        import httpx
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, data={"Twiml": twiml},
-                                     auth=(auth_account_sid, auth_token), timeout=5.0)
-        if resp.status_code >= 400:
-            logger.error(f"twilio_redirect failed ({resp.status_code}): {resp.text}")
-        else:
-            logger.info(f"[Queue] twilio_redirect 成功 ({resp.status_code})")
-    except Exception as e:
-        logger.error(f"twilio_redirect exception: {e}")
-
-
-
-async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: str):
-    """等待 queue_timeout_seconds 秒后，将仍在 waiting 状态的来电标记为 auto_transferred。
-    下次 /queue-check 轮询时会自动转接人工（无需 REST API 调用）。
-    """
-    await asyncio.sleep(config.queue_timeout_seconds)
-    caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
-    if caller and caller["status"] == "waiting":
-        caller["status"] = "auto_transferred"
-        logger.info(f"[Queue] {number} 等待超时 ({config.queue_timeout_seconds}s)，已标记 auto_transferred，等待下次轮询自动转人工")
-        await broadcast_admin("queue_update", safe_queue())
-
-
-
-TWILIO_QUEUE_NAME = "AIQueue"  # Twilio 原生队列名称
-_twilio_queue_sid: str | None = None  # 缓存队列 SID，避免每次出队时重复查询
-
-
-async def _get_or_create_queue_sid(auth_account: str, auth_token: str):
-    """
-    获取（并缓存）AIQueue 的 Twilio Queue SID（QUxxx 格式）。
-    
-    Twilio Queue Members REST API 只接受 Queue SID 作为路径参数，
-    不接受 FriendlyName，因此必须先通过 FriendlyName 查询到 SID。
-    结果会被缓存到 _twilio_queue_sid 全局变量中。
-    """
-    global _twilio_queue_sid
-    if _twilio_queue_sid:
-        return _twilio_queue_sid
-    
-    import httpx
-    list_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues.json"
-    try:
-        # 先尝试按 FriendlyName 查找已存在的队列
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                list_url,
-                params={"FriendlyName": TWILIO_QUEUE_NAME},
-                auth=(auth_account, auth_token),
-                timeout=5.0
-            )
-        if resp.status_code == 200:
-            queues = resp.json().get("queues", [])
-            if queues:
-                _twilio_queue_sid = queues[0]["sid"]
-                logger.info(f"[Queue] 找到已存在队列 SID: {_twilio_queue_sid}")
-                return _twilio_queue_sid
-        
-        # 队列不存在，创建新队列
-        logger.info(f"[Queue] 队列 '{TWILIO_QUEUE_NAME}' 不存在，正在创建...")
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                list_url,
-                data={"FriendlyName": TWILIO_QUEUE_NAME, "MaxSize": 100},
-                auth=(auth_account, auth_token),
-                timeout=5.0
-            )
-        if resp.status_code in (200, 201):
-            _twilio_queue_sid = resp.json()["sid"]
-            logger.info(f"[Queue] 新队列创建成功，SID: {_twilio_queue_sid}")
-            return _twilio_queue_sid
-        else:
-            logger.error(f"[Queue] 创建队列失败 ({resp.status_code}): {resp.text}")
-            return None
-    except Exception as e:
-        logger.error(f"[Queue] 获取队列 SID 异常: {e}")
-        return None
-
-
-async def twilio_dequeue_member(account_sid: str, url: str, call_sid: str = "Front", queue_sid: str | None = None, method: str = "POST") -> bool:
-    """
-    将队列中指定成员退出队列并执行指定 URL。
-    
-    queue_sid: 传入调用者记录中存储的实际 QueueSid（避免 REST API 查找返回错误的队列）
-    call_sid: 使用具体的来电 SID，避免 "Front" 的竞态 404
-    """
-    auth_account = config.twilio_account_sid or account_sid
-    auth_token = config.twilio_auth_token
-    if not auth_token:
-        logger.error("twilio_dequeue_member: TWILIO_AUTH_TOKEN 未配置")
-        return False
-    
-    # 优先使用调用者存储的实际 QueueSid（最可靠），如果没有则走 REST API 查找途径
-    if not queue_sid:
-        queue_sid = await _get_or_create_queue_sid(auth_account, auth_token)
-    if not queue_sid:
-        logger.error("[Queue] 无法获取 Queue SID，出队取消")
-        return False
-    
-    members_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Queues/{queue_sid}/Members/{call_sid}.json"
-    logger.info(f"[Queue] 出队请求: POST {members_url}, Url={url}")
-    
-    import httpx
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                members_url,
-                data={"Url": url, "Method": method},
-                auth=(auth_account, auth_token),
-                timeout=5.0
-            )
-        if resp.status_code >= 400:
-            logger.error(f"[Queue] 出队失败 ({resp.status_code}): {resp.text}")
-            if resp.status_code == 404:
-                global _twilio_queue_sid
-                _twilio_queue_sid = None  # 清除缓存，下次重新查询
-            return False
-        else:
-            logger.info(f"[Queue] 出队成功 ({resp.status_code})")
-            return True
-    except Exception as e:
-        logger.error(f"[Queue] 出队异常: {e}")
-        return False
-
-
-async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: str):
-    """等待 queue_timeout_seconds 秒后，将仍在 waiting 状态的来电自动转人工。"""
-    await asyncio.sleep(config.queue_timeout_seconds)
-    caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
-    if caller and caller["status"] == "waiting":
-        caller["status"] = "auto_transferred"
-        logger.info(f"[Queue] {number} 超时转人工, QueueSid={caller.get('twilio_queue_sid','??')}")
-        host = caller.get("host", "")
-        if host:
-            transfer_url = f"https://{host}/queue-transfer"
-            await twilio_dequeue_member(
-                account_sid,
-                url=transfer_url,
-                call_sid=call_sid,
-                queue_sid=caller.get("twilio_queue_sid")
-            )
-        else:
-            logger.error(f"[Queue] auto_transfer 失败: 没有 host")
-        await broadcast_admin("queue_update", safe_queue())
-
-
-
-async def dequeue_next_caller():
-    """
-    AI 通话结束后，将排队中的下一个来电直接重定向到 /incoming-call。
-    
-    使用 Twilio Update Call REST API (POST /Calls/{CallSid})，
-    通过内联 TwiML 将 in-progress 来电重定向到 /incoming-call。
-    这种方式绕过了 Enqueue Members API 的 404 问题。
-    """
-    next_c = next((c for c in waiting_calls if c["status"] == "waiting"), None)
-    if not next_c:
-        return
-    task = next_c.get("auto_transfer_task")
-    if task and not task.done():
-        task.cancel()
-    next_c["status"] = "connecting"
-    call_sid = next_c["call_sid"]
-    host = next_c.get("host", "")
-    account_sid = next_c.get("account_sid", "")
-    logger.info(f"[Queue] 重定向来电 {next_c['number']} (CallSid={call_sid}) → /incoming-call")
-
-    if not host or not account_sid:
-        logger.error("[Queue] dequeue 失败: 缺少 host 或 account_sid")
-        next_c["status"] = "waiting"
-        await broadcast_admin("queue_update", safe_queue())
-        return
-
-    auth_account = config.twilio_account_sid or account_sid
-    auth_token = config.twilio_auth_token
-    if not auth_token:
-        logger.error("[Queue] dequeue 失败: TWILIO_AUTH_TOKEN 未配置")
-        next_c["status"] = "waiting"
-        await broadcast_admin("queue_update", safe_queue())
-        return
-
-    # 方法1：通过 Update Call API 将 in-progress 来电重定向
-    update_url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account}/Calls/{call_sid}.json"
-    redirect_twiml = f"""<Response><Redirect method="POST">https://{host}/incoming-call</Redirect></Response>"""
-
-    logger.info(f"[Queue] Update Call: POST {update_url}")
-    import httpx
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                update_url,
-                data={"Twiml": redirect_twiml},
-                auth=(auth_account, auth_token),
-                timeout=5.0
-            )
-        if resp.status_code >= 400:
-            logger.error(f"[Queue] Update Call 失败 ({resp.status_code}): {resp.text}")
-            # 如果 Update Call 失败，尝试 Members API 作为备用
-            logger.info("[Queue] 尝试 Members API 备用方案...")
-            twilio_queue_sid = next_c.get("twilio_queue_sid")
-            if twilio_queue_sid:
-                ok = await twilio_dequeue_member(
-                    account_sid=account_sid,
-                    url=f"https://{host}/incoming-call",
-                    call_sid=call_sid,
-                    queue_sid=twilio_queue_sid
-                )
-                if ok:
-                    logger.info("[Queue] Members API 备用成功")
-                    await broadcast_admin("queue_update", safe_queue())
-                    return
-            logger.error("[Queue] 所有出队方法失败，回滚状态为 waiting")
-            next_c["status"] = "waiting"
-        else:
-            logger.info(f"[Queue] Update Call 成功 ({resp.status_code}): 来电已重定向到 /incoming-call")
-    except Exception as e:
-        logger.error(f"[Queue] Update Call 异常: {e}")
-        next_c["status"] = "waiting"
-
-    await broadcast_admin("queue_update", safe_queue())
 
 
 # =============================================================================
@@ -643,15 +434,13 @@ async def change_password(req: PasswordChangeRequest, role: str = Depends(verify
 @app.post("/api/admin/reset-busy")
 async def reset_busy(role: str = Depends(verify_admin)):
     """
-    紧急重置 AI 繁忙锁。
-    当 Twilio 通话意外断开导致 global_ai_busy 卡在 True 时，
-    管理员可通过此端点强制释放锁，无需重启服务器。
+    查询并重置 AI 并发状态。
+    当通话意外断开导致 ACTIVE_CALLS 未能正确清除时，
+    管理员可通过此端点广播当前真实状态，无需重启服务器。
     """
-    global global_ai_busy
-    global_ai_busy = False
-    await broadcast_admin("ai_status", {"busy": False})
-    logger.warning("⚠️ 管理员手动重置了 global_ai_busy 锁定状态")
-    return {"status": "ok", "message": "AI busy lock has been reset"}
+    await broadcast_admin("ai_status", {"busy": len(ACTIVE_CALLS) >= config.max_concurrent_calls})
+    logger.warning("⚠️ 管理员查询并发状态，当前 ACTIVE_CALLS: %d", len(ACTIVE_CALLS))
+    return {"status": "ok", "message": f"Active calls: {len(ACTIVE_CALLS)}, max: {config.max_concurrent_calls}"}
 
 @app.websocket("/api/admin/ws")
 async def admin_websocket(websocket: WebSocket, token: str = None):
@@ -1456,89 +1245,6 @@ async def clear_logs():
 
 from pydantic import BaseModel
 
-class TransferQueueRequest(BaseModel):
-    call_sid: str
-
-@app.post("/api/admin/queue/transfer")
-async def transfer_queued_call(
-    request: TransferQueueRequest,
-    background_tasks: BackgroundTasks,
-    role: str = Depends(verify_admin)
-):
-    """
-    一键将正在排队区听等待音乐的客户强行转接到人工。
-    原理：使用 Twilio REST API 对正在执行的 Call 覆盖新的 TwiML 指令（挂断并拨号至客服）。
-    注意：此接口要求高级管理员权限（admin role），普通接线员（staff）无权使用。
-    """
-    # verify_admin 已经在拦截器层面确保了只有 admin 能通过
-
-    global waiting_calls
-    call_sid = request.call_sid
-    
-    # 2. 在排队缓存中寻找目标
-    target_call = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
-    if not target_call:
-        raise HTTPException(status_code=404, detail="Call not found in wait queue")
-    if target_call["status"] != "waiting":
-        raise HTTPException(status_code=400, detail=f"Call is not in waiting state (status: {target_call['status']})")
-
-    account_sid = target_call.get("account_sid", "")
-    # 取消 100 秒倒计时
-    task = target_call.get("auto_transfer_task")
-    if task and not task.done():
-        task.cancel()
-    target_call["status"] = "manual_transferred"
-
-    await twilio_redirect(call_sid, account_sid,
-        f'<Response><Say voice="Polly.Amy">Transferring to human agent. Please hold.</Say>'
-        f'<Dial>{config.transfer_phone_number}</Dial></Response>')
-
-    logger.info(f"[Queue] 管理员手动转接: {call_sid}")
-    await broadcast_admin("queue_update", safe_queue())
-    return {"status": "success", "message": "Call transferred to human"}
-
-
-@app.post("/api/admin/queue/connect/{call_sid}")
-async def connect_queued_to_ai(call_sid: str, role: str = Depends(verify_admin)):
-    """管理员手动让排队来电立即接通 AI（仅限 AI 空闲时）。"""
-    global global_ai_busy, waiting_calls
-    if global_ai_busy:
-        raise HTTPException(status_code=400, detail="AI is currently busy")
-    caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
-    if not caller or caller["status"] != "waiting":
-        raise HTTPException(status_code=404, detail="Call not found or not in waiting state")
-    task = caller.get("auto_transfer_task")
-    if task and not task.done():
-        task.cancel()
-    caller["status"] = "connecting"
-    await twilio_redirect(call_sid, caller["account_sid"],
-        "<Response><Redirect>/incoming-call</Redirect></Response>")
-    await broadcast_admin("queue_update", safe_queue())
-    return {"status": "success", "message": "Call being connected to AI"}
-
-
-@app.post("/call-status")
-async def call_status_callback(request: Request):
-    """Twilio 状态回调 Webhook：检测排队中的来电是否主动挂断。
-    需在 TwiML 中或 Twilio Console 设置 statusCallback=/call-status。
-    """
-    form = await request.form()
-    call_sid = form.get("CallSid", "")
-    call_status = form.get("CallStatus", "")
-    if call_status == "completed":
-        for c in waiting_calls:
-            if c["call_sid"] == call_sid and c["status"] == "waiting":
-                c["status"] = "hung_up"
-                task = c.get("auto_transfer_task")
-                if task and not task.done():
-                    task.cancel()
-                logger.info(f"[Queue] 来电 {c['number']} 主动挂断")
-                await broadcast_admin("queue_update", safe_queue())
-                break
-    return Response("ok")
-
-
-
 # =============================================================================
 # 核心业务路由：Twilio 电话接入
 # =============================================================================
@@ -1612,75 +1318,42 @@ async def incoming_call(request: Request, background_tasks: BackgroundTasks):
         """
         return Response(content=twiml, media_type="application/xml")
 
-    # --- 路由判断 3：排队控制 (global_ai_busy) ---
-    global global_ai_busy, waiting_calls
-
-    if global_ai_busy:
-        # AI 当前忙碌，判断阯列是否已满
-        current_waiting = sum(1 for c in waiting_calls if c["status"] == "waiting")
-        if current_waiting >= config.max_queue_size:
-            logger.warning(f"排队已满 ({config.max_queue_size})！触发溢出: {config.call_overflow_action}")
-            if config.call_overflow_action == "transfer":
-                twiml = f"""
-                <Response>
-                    <Say voice="Polly.Amy">Sorry, all lines and queue are full. Transferring to a human agent.</Say>
-                    <Dial>{config.transfer_phone_number}</Dial>
-                </Response>"""
-            else:
-                twiml = """<Response>
-                    <Say voice="Polly.Amy">Sorry, we are experiencing high call volumes. Please try again later.</Say>
-                    <Hangup/>
-                </Response>"""
-            return Response(content=twiml, media_type="application/xml")
-
-        # 将来电加入 Twilio 原生队列 (Enqueue)
-        # ★ Enqueue 是正确和可靠的排队方式：
-        #   - Twilio 自动通过 waitUrl 播放等待音乐（自动循环）
-        #   - 出队通过 Members API (POST /Queues/QueueName/Members/Front)
-        #   - Enqueued 通话支持 Members API 操作，不会像 Play 状态一样 404
-        logger.info(f"状态 [Queue]: 系统忙碌，号码 {caller_number} 进入 Twilio 内建队列等待。")
-        wait_msg = config.wait_message or "All lines are currently busy, please hold on."
-
-        twiml = f"""<Response>
-            <Say voice="Polly.Amy">{wait_msg}</Say>
-            <Enqueue waitUrl="https://{host}/queue-wait-music" waitUrlMethod="GET">{TWILIO_QUEUE_NAME}</Enqueue>
-        </Response>"""
-
-
-        # 启动超时计时
-        timeout_task = asyncio.create_task(
-            auto_transfer_after_timeout(call_sid, account_sid, caller_number)
+    # --- 路由判断 3：并发上限检查 ---
+    active_count = len(ACTIVE_CALLS)
+    if active_count >= config.max_concurrent_calls:
+        logger.warning(
+            f"[并发] 已达上限 ({active_count}/{config.max_concurrent_calls})，"
+            f"拒绝来电 {caller_number}"
         )
-        waiting_calls.append({
-            "call_sid":          call_sid,
-            "account_sid":       account_sid,
-            "number":            caller_number,
-            "joined_at":         time.time(),
-            "status":            "waiting",
-            "order_finalized":   None,
-            "auto_transfer_task": timeout_task,
-            "host":              host,  # 存储 host 供 dequeue_next_caller 使用
-        })
-        background_tasks.add_task(broadcast_admin, "queue_update", safe_queue())
+        call_log_add(call_sid, caller_number, "twilio")
+        call_log_end(call_sid, order_finalized=None, missed=True)
+        background_tasks.add_task(broadcast_admin, "call_log_update", safe_call_log())
+        if config.busy_message and config.busy_message.strip():
+            twiml = f"""<Response>
+                <Say voice="Polly.Amy">{config.busy_message}</Say>
+                <Hangup/>
+            </Response>"""
+        else:
+            twiml = """<Response><Reject reason="busy"/></Response>"""
         return Response(content=twiml, media_type="application/xml")
 
+    # --- 路由判断 4：正常接待（active 模式，容量未满）---
+    call_log_add(call_sid, caller_number, "twilio")
+    background_tasks.add_task(broadcast_admin, "call_log_update", safe_call_log())
+    background_tasks.add_task(broadcast_admin, "ai_status", {"busy": active_count + 1 >= config.max_concurrent_calls})
 
-    # --- 路由判断 4：正常接待（active 模式）---
-    # AI 空闲，上锁准备接通
-    global_ai_busy = True
-    background_tasks.add_task(broadcast_admin, "ai_status", {"busy": True})
-
-    # 当前这通直接接通的来电也记入排队区（connecting 状态）
-    waiting_calls.append({
-        "call_sid":          call_sid,
-        "account_sid":       account_sid,
-        "number":            caller_number,
-        "joined_at":         time.time(),
-        "status":            "connecting",
-        "order_finalized":   None,
-        "auto_transfer_task": None,
-    })
-    background_tasks.add_task(broadcast_admin, "queue_update", safe_queue())
+    twiml = f"""
+    <Response>
+        <Connect>
+            <Stream url="wss://{host}/media-stream">
+                <Parameter name="customer_number" value="{caller_number}" />
+            </Stream>
+        </Connect>
+        <!-- WebSocket 关闭后，Twilio 重定向到此路由继续执行 TwiML -->
+        <Redirect method="POST">https://{host}/stream-ended</Redirect>
+    </Response>
+    """
+    return Response(content=twiml, media_type="application/xml")
 
 
     # <Connect><Stream> 是核心指令，指示 Twilio 建立 WebSocket 媒体流
@@ -1766,144 +1439,6 @@ async def stream_ended(request: Request):
         """
 
     return Response(content=twiml, media_type="application/xml")
-
-
-@app.get("/queue-wait-music")
-async def queue_wait_music(request: Request):
-    """
-    Twilio Enqueue 的 waitUrl 端点。
-    
-    关键：Twilio 调用此 URL 时会传入 QueueSid 和 CallSid 参数。
-    我们利用这个机会记录**Twilio 实际用到的队列 SID**，避免后续出队时用错队列。
-    """
-    # 从 Twilio 传入的参数中获取实际的队列 SID 和 CallSid
-    twilio_queue_sid = request.query_params.get("QueueSid", "")
-    twilio_call_sid = request.query_params.get("CallSid", "")
-    
-    if twilio_queue_sid and twilio_call_sid:
-        # 更新 waiting_calls 中对应记录，存入 Twilio 实际用的 QueueSid
-        caller = next((c for c in waiting_calls if c["call_sid"] == twilio_call_sid), None)
-        if caller:
-            if caller.get("twilio_queue_sid") != twilio_queue_sid:
-                # 首次获取到，或者发生变化，记录并日志
-                old = caller.get("twilio_queue_sid", "None")
-                caller["twilio_queue_sid"] = twilio_queue_sid
-                logger.info(f"[Queue] 等待音乐 CallSid={twilio_call_sid}: 实际 QueueSid={twilio_queue_sid} (覆盖旧={old})")
-        else:
-            # 记录 QueueSid 到全局缓存，以防 waiting_calls 还未导入
-            logger.info(f"[Queue] /queue-wait-music: 未找到 CallSid={twilio_call_sid} 的记录，将 QueueSid={twilio_queue_sid} 存入缓存")
-            # 尝试用 QueueSid 更新全局 SID 缓存（以便删除错误的一个）
-            global _twilio_queue_sid
-            if _twilio_queue_sid != twilio_queue_sid:
-                logger.warning(f"[Queue] 发现 QueueSid 键大！好队列={twilio_queue_sid} vs 缓存={_twilio_queue_sid}")
-    
-    wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
-    twiml = f"""<Response>
-    <Play>{wait_music}</Play>
-</Response>"""
-    return Response(content=twiml, media_type="application/xml")
-
-
-@app.post("/queue-transfer")
-async def queue_transfer(request: Request):
-    """
-    超时转人工的出队目标 URL。
-    当 auto_transfer_after_timeout 触发时，Members API 会把排队电话路由到此 URL。
-    """
-    transfer_number = config.transfer_phone_number or ""
-    twiml = f"""<Response>
-    <Say voice="Polly.Amy">Sorry for the long wait, transferring you to a human agent now.</Say>
-    <Dial>{transfer_number}</Dial>
-</Response>"""
-    return Response(content=twiml, media_type="application/xml")
-
-
-
-
-@app.post("/queue-check")
-async def queue_check(request: Request):
-
-    """
-    排队状态轮询端点。
-    
-    等待中的来电每次 <Play> 音乐结束后，Twilio 会 POST 到此处。
-    根据服务器内存中该通话的状态，决定下一步动作：
-        - connecting  → AI 已空闲，立即接通（Redirect 到 /incoming-call）
-        - waiting     → 继续等待，再播一段音乐后再次轮询
-        - auto_transferred → 已超时自动转接，告知用户并 Dial 人工
-        - 其他        → 直接 Hangup
-        
-    ★ 这个机制完全避免了通过 Twilio REST API 强制更新 in-progress 通话
-      （REST API 更新 Play 状态的通话会返回 404，是 Twilio 的已知限制）。
-    """
-    global global_ai_busy, waiting_calls  # 在函数顶部声明，避免 Python prior-use 语法错误
-    form_data = await request.form()
-    call_sid = form_data.get("CallSid", "Unknown")
-    caller_number = form_data.get("From", "Unknown")
-    host = request.headers.get("host", "localhost")
-    
-    logger.info(f"[Queue-Check] CallSid={call_sid}, From={caller_number}")
-    
-    # 在 waiting_calls 里找到这个来电
-    caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
-    
-    if not caller:
-        # 找不到记录（可能已过期或被清理），直接挂断
-        logger.warning(f"[Queue-Check] 未找到 CallSid={call_sid} 的排队记录，挂断")
-        return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
-    
-    status = caller.get("status", "waiting")
-    logger.info(f"[Queue-Check] 当前状态: {status}, 号码: {caller.get('number')}")
-    
-    if status == "connecting":
-        # AI 已空闲且已标记接通 → 直接返回 Connect+Stream TwiML
-        # （此分支秐存作备用，如果 Enqueue 失败可回退到此路径）
-        
-        logger.info(f"[Queue-Check] ✅ 状态为 connecting，直接返回 Stream TwiML 接通 AI: {caller.get('number')}")
-        
-        # 注意：不在这里设置 global_ai_busy=True，避免 stream 未建立时状态卡死
-        # global_ai_busy 将在 /media-stream 连接事件触发后由 /incoming-call 设置
-        
-        twiml = f"""<Response>
-    <Connect>
-        <Stream url="wss://{host}/media-stream">
-            <Parameter name="customer_number" value="{caller_number}" />
-        </Stream>
-    </Connect>
-    <Redirect method="POST">https://{host}/stream-ended</Redirect>
-</Response>"""
-        return Response(content=twiml, media_type="application/xml")
-    
-    elif status == "auto_transferred":
-        # 已超时转人工
-        logger.info(f"[Queue-Check] ⏰ 状态为 auto_transferred，转人工: {caller.get('number')}")
-        transfer_number = config.transfer_phone_number or ""
-        return Response(
-            content=f"""<Response>
-                <Say voice="Polly.Amy">Sorry for the long wait, transferring you to a human agent now.</Say>
-                <Dial>{transfer_number}</Dial>
-            </Response>""",
-            media_type="application/xml"
-        )
-    
-    elif status in ("waiting",):
-        # 仍在等待 → 再播一段音乐，然后再次轮询（用绝对路径避免相对路径解析问题）
-        wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
-        logger.info(f"[Queue-Check] ⏳ 状态为 waiting，继续播放等待音乐: {caller.get('number')}")
-        return Response(
-            content=f"""<Response>
-                <Play>{wait_music}</Play>
-                <Redirect method="POST">https://{host}/queue-check</Redirect>
-            </Response>""",
-            media_type="application/xml"
-        )
-    
-    else:
-        # 其他状态（completed, hung_up 等）→ 挂断
-        logger.info(f"[Queue-Check] 状态为 {status}，挂断")
-        return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
-
-
 
 
 @app.websocket("/media-stream")
@@ -2464,16 +1999,16 @@ async def handle_media_stream(websocket: WebSocket):
                                             "transcript": call_transcript
                                         }
 
-                                        # 持久化保存订单到 orders.json
-                                        database.save_order(order_record)
-
-                                        # 更新客户历史档案
-                                        summary = f"{order_id}: {len(items)} items (€{total})"
-                                        database.update_customer_history(
-                                            customer_number, summary,
-                                            name=call_args.get('customer_name'),
-                                            address=call_args.get('customer_address')
-                                        )
+                                        # 持久化保存订单（锁防并发写入损坏）
+                                        async with _db_write_lock:
+                                            database.save_order(order_record)
+                                            # 更新客户历史档案
+                                            summary = f"{order_id}: {len(items)} items (€{total})"
+                                            database.update_customer_history(
+                                                customer_number, summary,
+                                                name=call_args.get('customer_name'),
+                                                address=call_args.get('customer_address')
+                                            )
 
                                         logger.info(f"✅ 订单已归档: {order_id}")
                                         order_finalized = True  # 标记正式完成，草稿不再需要
@@ -2696,21 +2231,15 @@ async def handle_media_stream(websocket: WebSocket):
                     "active_calls": ACTIVE_CALLS
                 })
             
-            # --- Wait Queue 解锁机制 ---
-            global global_ai_busy, waiting_calls
-            global_ai_busy = False  # 释放 AI 接线员锁定状态
-            await broadcast_admin("ai_status", {"busy": False})
-
-            # 将本次通话的记录更新为 completed，并记录点单是否完成
-            for c in waiting_calls:
-                if c["call_sid"] == stream_call_sid and c["status"] == "connecting":
-                    c["status"] = "completed"
-                    c["order_finalized"] = order_finalized
-                    break
-            await broadcast_admin("queue_update", safe_queue())
-
-            # 自动接通排队中下一个 waiting 来电
-            await dequeue_next_caller()
+            # 更新呼入日志（Twilio 媒体流结束）
+            transferred_flag = (CALL_STATES.get(stream_call_sid, {}).get("intent") == "transfer") if stream_call_sid else False
+            call_log_end(
+                stream_call_sid,
+                order_finalized=order_finalized,
+                transferred=transferred_flag
+            )
+            await broadcast_admin("call_log_update", safe_call_log())
+            await broadcast_admin("ai_status", {"busy": len(ACTIVE_CALLS) >= config.max_concurrent_calls})
 
 
 async def send_setup_message(
@@ -2845,17 +2374,14 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
 
     stream_call_sid = None  # 在 finally 块中使用，需要在 try 块外初始化
     
-    global global_ai_busy, waiting_calls
-    # 防线 1: 接通前互斥拦截 WebRTC
-    # 如果系统当前处于繁忙（例如正在接头 Twilio 或另一个 Web 模拟器）
-    if global_ai_busy:
-        logger.info("Web 模拟连接被拒绝：AI 当前忙碌中")
-        await websocket.close(code=1008, reason="AI is currently serving another customer")
+    # 并发上限检查（WebRTC 和 Twilio 共享同一个计数器）
+    config.reload_settings()
+    if len(ACTIVE_CALLS) >= config.max_concurrent_calls:
+        logger.info(f"[WebRTC] 连接被拒绝：已达并发上限 ({len(ACTIVE_CALLS)}/{config.max_concurrent_calls})")
+        await websocket.close(code=1008, reason="All lines are busy")
         return
-        
-    # 上锁：Web RTC 霸占 AI 线
-    global_ai_busy = True
-    await broadcast_admin("ai_status", {"busy": True})  # 直接 await，WebSocket 无 background_tasks
+
+    await broadcast_admin("ai_status", {"busy": len(ACTIVE_CALLS) + 1 >= config.max_concurrent_calls})
 
     try:
         # --- 等待前端发送 start 事件 ---
@@ -3204,13 +2730,15 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                                 "transcript": json.dumps(call_transcript)
                                             }
 
-                                            database.save_order(order_record)
-                                            summary = f"{order_id}: {len(items)} items (€{total})"
-                                            database.update_customer_history(
-                                                customer_number, summary,
-                                                name=args.get('customer_name'),
-                                                address=args.get('customer_address')
-                                            )
+                                            # 锁防并发写入损坏
+                                            async with _db_write_lock:
+                                                database.save_order(order_record)
+                                                summary = f"{order_id}: {len(items)} items (€{total})"
+                                                database.update_customer_history(
+                                                    customer_number, summary,
+                                                    name=args.get('customer_name'),
+                                                    address=args.get('customer_address')
+                                                )
                                             logger.info(f"✅ Web模拟订单归档: {order_id}")
 
                                             # 更新管理面板的今日订单计数
@@ -3309,7 +2837,8 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                     "source": "AI (WebSim Incomplete)",
                     "transcript": json.dumps(call_transcript)
                 }
-                database.save_order(rescue_record)
+                async with _db_write_lock:
+                    database.save_order(rescue_record)
                 logger.warning(f"⚠️ WebSim草稿订单已救援保存: {rescue_id}")
                 _completed, _incomplete = get_order_counts()
                 await broadcast_admin("new_order", {
@@ -3331,12 +2860,14 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
             })
         logger.info(f"Web 模拟通话已清理，SID: {stream_call_sid}")
 
-        # --- WebRTC Wait Queue 解锁机制 ---
-        global_ai_busy = False
-        await broadcast_admin("ai_status", {"busy": False})
-
-        # 自动接通排队中下一个 waiting 来电（支持 WebRTC 后接 Twilio 排队来电）
-        await dequeue_next_caller()
+        # 更新呼入日志 + 广播
+        call_log_end(
+            stream_call_sid,
+            order_finalized=order_finalized,
+            transferred=(CALL_STATES.get(stream_call_sid, {}).get("intent") == "transfer") if stream_call_sid else False
+        )
+        await broadcast_admin("call_log_update", safe_call_log())
+        await broadcast_admin("ai_status", {"busy": len(ACTIVE_CALLS) >= config.max_concurrent_calls})
 
 
 # =============================================================================
