@@ -348,7 +348,8 @@ function App() {
   const [activeCallCount, setActiveCallCount] = useState(0);
   const [activeCallsList, setActiveCallsList] = useState({}); // { sid: { start_time, caller_number, caller_name } }
   const [activeViewCallSid, setActiveViewCallSid] = useState(null); // Which call's transcript is currently visible
-  const [transcripts, setTranscripts] = useState([]); // { id, role, text, is_final, call_sid }
+  // 按 call_sid 分组存储，彩道隔离，并发通话不互串
+  const [transcripts, setTranscripts] = useState({}); // { [call_sid]: [{id,role,text,is_final},...] }
   const [totalOrders, setTotalOrders] = useState(0);         // 今日完成订单数
   const [incompleteOrders, setIncompleteOrders] = useState(0); // 今日草稿/断线订单数
   const [dashboardStats, setDashboardStats] = useState(null); // The historical trend stats
@@ -467,75 +468,53 @@ function App() {
         } else if (msg.event === 'call_end') {
           setActiveCallCount(msg.data.active_count);
           setActiveCallsList(msg.data.active_calls || {});
-          setTranscripts(prev => [...prev, { id: Date.now(), role: 'system', text: `Call ended`, is_final: true, call_sid: msg.data.call_sid }]);
+          const endedSid = msg.data.call_sid;
+          setTranscripts(prev => ({
+            ...prev,
+            [endedSid]: [...(prev[endedSid] || []), { id: Date.now(), role: 'system', text: 'Call ended', is_final: true }]
+          }));
         } else if (msg.event === 'transcript') {
+          const { role, text, is_final, call_sid } = msg.data;
+
+          // 切换当前视图到最新话路
+          setActiveViewCallSid(current => current || call_sid);
+
           setTranscripts(prev => {
-             const { role, text, is_final, call_sid } = msg.data;
-             // If we receive a transcript for a call we aren't looking at, auto-switch
-             setActiveViewCallSid(current => {
-               if (!current) return call_sid;
-               // New call_sid means a fresh call started — clear old receipt and transcripts
-               if (current !== call_sid) {
-                 setLiveOrder(null);
-                 return call_sid;
-               }
-               return current;
-             });
-             const newTranscripts = [...prev];
-             
-             if (role === 'user' && !is_final) {
-                 // Try to find the last active streaming user message
-                 const lastIdx = newTranscripts.length - 1;
-                 if (lastIdx >= 0 && newTranscripts[lastIdx].role === 'user' && !newTranscripts[lastIdx].is_final) {
-                     newTranscripts[lastIdx].text = text; // Gemini sends cumulative chunk text
-                     return newTranscripts;
-                 }
-                 // If not found, create new streaming entry
-                 return [...newTranscripts, { id: Date.now(), role, text, is_final, call_sid }];
-             } 
-             
-             if (role === 'user' && is_final) {
-                 // Mark the last user message as final
-                 const lastIdx = newTranscripts.length - 1;
-                 if (lastIdx >= 0 && newTranscripts[lastIdx].role === 'user' && !newTranscripts[lastIdx].is_final) {
-                     newTranscripts[lastIdx].text = text;
-                     newTranscripts[lastIdx].is_final = true;
-                     return newTranscripts;
-                 }
-                 return [...newTranscripts, { id: Date.now(), role, text, is_final, call_sid }];
-             }
+            const callEntries = [...(prev[call_sid] || [])];
 
-             if (role === 'ai' && !is_final) {
-                 // Try to find the last active streaming ai message
-                 const lastIdx = newTranscripts.length - 1;
-                 if (lastIdx >= 0 && newTranscripts[lastIdx].role === 'ai' && !newTranscripts[lastIdx].is_final) {
-                     newTranscripts[lastIdx].text = text; // Gemini sends cumulative chunk text
-                     return newTranscripts;
-                 }
-                 // If not found, create new streaming entry
-                 return [...newTranscripts, { id: Date.now(), role, text, is_final, call_sid }];
-             }
+            if ((role === 'user' || role === 'ai') && !is_final) {
+              // 流式 chunk：如果该路最后一条是同角色的未完成条目，直接更新文本
+              const lastIdx = callEntries.length - 1;
+              if (lastIdx >= 0 && callEntries[lastIdx].role === role && !callEntries[lastIdx].is_final) {
+                callEntries[lastIdx] = { ...callEntries[lastIdx], text };
+                return { ...prev, [call_sid]: callEntries };
+              }
+              return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: false }] };
+            }
 
-             if (role === 'ai' && is_final) {
-                 // Mark the last ai message as final
-                 const lastIdx = newTranscripts.length - 1;
-                 if (lastIdx >= 0 && newTranscripts[lastIdx].role === 'ai' && !newTranscripts[lastIdx].is_final) {
-                     newTranscripts[lastIdx].text = text;
-                     newTranscripts[lastIdx].is_final = true;
-                     return newTranscripts;
-                 }
-                 return [...newTranscripts, { id: Date.now(), role, text, is_final, call_sid }];
-             }
-             
-             // AI messages or other final messages just append
-             return [...newTranscripts, { id: Date.now(), role, text, is_final: true, call_sid }];
+            if ((role === 'user' || role === 'ai') && is_final) {
+              // 完成 chunk：封厕最后一条未完成条目
+              const lastIdx = callEntries.length - 1;
+              if (lastIdx >= 0 && callEntries[lastIdx].role === role && !callEntries[lastIdx].is_final) {
+                callEntries[lastIdx] = { ...callEntries[lastIdx], text, is_final: true };
+                return { ...prev, [call_sid]: callEntries };
+              }
+              return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: true }] };
+            }
+
+            // thought / system / tool 等直接追加
+            return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: true }] };
           });
         } else if (msg.event === 'ai_status') {
           setAiBusy(msg.data.busy);
         } else if (msg.event === 'call_log_update') {
           setCallLog(msg.data || []);
         } else if (msg.event === 'system_log') {
-          setTranscripts(prev => [...prev, { id: Date.now() + Math.random(), role: 'system_log', text: msg.data.message, type: msg.data.type || 'info', call_sid: msg.data.call_sid }]);
+          const sid = msg.data.call_sid || '__system__';
+          setTranscripts(prev => ({
+            ...prev,
+            [sid]: [...(prev[sid] || []), { id: Date.now() + Math.random(), role: 'system_log', text: msg.data.message, type: msg.data.type || 'info' }]
+          }));
         } else if (msg.event === 'tool_call') {
           // 注：由于后端 (server.py + audio_injector.py) 现在已经原生向 WebSocket 音频流
           // 注入了高保真的预读取 WAV 打字声音，前端不再需要（也不能）使用
@@ -551,15 +530,12 @@ function App() {
             else if (c.name === 'get_past_order') toolDesc = "正在查询历史订单...";
             else if (c.name === 'end_call') toolDesc = "正在生成并保存订单...";
             
+            const sid = msg.data.call_sid || activeViewCallSid || '__unknown__';
             const text = `⚙️ [系统] ${toolDesc}`;
-            setTranscripts(prev => [...prev, { 
-              id: Date.now() + Math.random(), 
-              role: 'tool', 
-              text: text, 
-              args: c.args,
-              call_sid: msg.data.call_sid, 
-              is_animating: true 
-            }]);
+            setTranscripts(prev => ({
+              ...prev,
+              [sid]: [...(prev[sid] || []), { id: Date.now() + Math.random(), role: 'tool', text, args: c.args, is_animating: true }]
+            }));
           });
         } else if (msg.event === 'tool_response') {
           // Play a gentle "success" chime
@@ -581,17 +557,18 @@ function App() {
             }
           } catch(e) {}
 
-          // Mark matching tools as completed
+          // 将最近一条 tool 条目标记为已完成
           setTranscripts(prev => {
-            const newT = [...prev];
-            for (let i = newT.length - 1; i >= 0; i--) {
-              if (newT[i].role === 'tool' && newT[i].is_animating) {
-                newT[i].is_animating = false;
-                newT[i].text = newT[i].text + " (已完成)";
-                break; // mark one by one
+            const sid = activeViewCallSid || Object.keys(prev).pop();
+            if (!sid || !prev[sid]) return prev;
+            const entries = [...prev[sid]];
+            for (let i = entries.length - 1; i >= 0; i--) {
+              if (entries[i].role === 'tool' && entries[i].is_animating) {
+                entries[i] = { ...entries[i], is_animating: false, text: entries[i].text + ' (已完成)' };
+                break;
               }
             }
-            return newT;
+            return { ...prev, [sid]: entries };
           });
         } else if (msg.event === 'live_order_update') {
           setLiveOrder(msg.data);
@@ -1262,23 +1239,18 @@ function App() {
                     )}
 
                     <div className="flex-1 overflow-y-auto p-4 space-y-3 font-mono text-sm" id="transcript-container">
-                      {transcripts.filter(msg =>
-                        // system_log 等无 call_sid 的消息始终显示
-                        !msg.call_sid ||
-                        // 未指定查看某路通话时，显示全部
-                        !activeViewCallSid ||
-                        // 正在查看某路通话时，只显示匹配的消息
-                        msg.call_sid === activeViewCallSid
-                      ).length === 0 ? (
-                        <div className="text-slate-600 italic mt-4 text-center">
-                          {lang === 'zh' ? '等待接入系统通话...' : 'Waiting for call...'}
-                        </div>
-                      ) : (
-                        transcripts.filter(msg =>
-                          !msg.call_sid ||
-                          !activeViewCallSid ||
-                          msg.call_sid === activeViewCallSid
-                        ).map((msg) => (
+                      {(() => {
+                        // 只显示当前察看话路的记录，完全隔离并发干扰
+                        const visibleEntries = [
+                          ...(transcripts[activeViewCallSid] || []),
+                          ...(transcripts['__system__'] || []),
+                        ];
+                        if (visibleEntries.length === 0) {
+                          return <div className="text-slate-600 italic mt-4 text-center">
+                            {lang === 'zh' ? '等待接入系统通话...' : 'Waiting for call...'}
+                          </div>;
+                        }
+                        return visibleEntries.map((msg) => (
                           <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : msg.role === 'ai' ? 'justify-start' : 'justify-center'} w-full`}>
                             {msg.role === 'system' ? (
                               <div className="text-slate-500 text-xs my-2 bg-slate-950 px-3 py-1 rounded-full border border-slate-800">
@@ -1319,9 +1291,9 @@ function App() {
                               </div>
                             )}
                           </div>
-                        ))
-                      )}
-                       <AutoScrollTrigger transcripts={transcripts} />
+                        ));
+                      })()}
+                       <AutoScrollTrigger transcripts={transcripts[activeViewCallSid] || []} />
                      </div>
                    </div>
 
