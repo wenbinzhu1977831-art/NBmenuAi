@@ -334,21 +334,24 @@ async def twilio_redirect(call_sid: str, account_sid: str, twiml: str):
 
 
 async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: str):
-    """等待 queue_timeout_seconds 秒后，将仍在 waiting 状态的来电自动转人工。"""
+    """等待 queue_timeout_seconds 秒后，将仍在 waiting 状态的来电标记为 auto_transferred。
+    下次 /queue-check 轮询时会自动转接人工（无需 REST API 调用）。
+    """
     await asyncio.sleep(config.queue_timeout_seconds)
     caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
     if caller and caller["status"] == "waiting":
         caller["status"] = "auto_transferred"
-        logger.info(f"[Queue] {number} 等待超时 ({config.queue_timeout_seconds}s)，自动转人工")
-        await twilio_redirect(call_sid, account_sid,
-            f"<Response><Say voice='Polly.Amy'>Sorry for the wait, "
-            f"transferring you to a human agent now.</Say>"
-            f"<Dial>{config.transfer_phone_number}</Dial></Response>")
+        logger.info(f"[Queue] {number} 等待超时 ({config.queue_timeout_seconds}s)，已标记 auto_transferred，等待下次轮询自动转人工")
         await broadcast_admin("queue_update", safe_queue())
 
 
+
 async def dequeue_next_caller():
-    """AI 通话结束后，自动接通排队中第一个 status='waiting' 的来电。"""
+    """AI 通话结束后，标记排队中第一个 waiting 状态的来电为 connecting。
+    
+    该来电会在下次轮询 /queue-check 时自动检测到状态变化并直接连入 AI。
+    此方法替代了不可靠的 twilio_redirect REST API 调用（后者在 Play 状态下一直返回 404）。
+    """
     next_c = next((c for c in waiting_calls if c["status"] == "waiting"), None)
     if not next_c:
         return
@@ -356,9 +359,7 @@ async def dequeue_next_caller():
     if task and not task.done():
         task.cancel()
     next_c["status"] = "connecting"
-    logger.info(f"[Queue] 自动接通等待来电: {next_c['number']}")
-    await twilio_redirect(next_c["call_sid"], next_c["account_sid"],
-        "<Response><Redirect>/incoming-call</Redirect></Response>")
+    logger.info(f"[Queue] 已标记来电 {next_c['number']} 为 connecting，等待其下次轮询 /queue-check 时自动接通")
     await broadcast_admin("queue_update", safe_queue())
 
 
@@ -1450,15 +1451,19 @@ async def incoming_call(request: Request, background_tasks: BackgroundTasks):
                 </Response>"""
             return Response(content=twiml, media_type="application/xml")
 
-        # 将来电放入无限音乐循环（由我们控制生命周期，而非 Twilio Enqueue）
+        # 排队等待：播放一段音乐后 redirect 到 /queue-check 轮询点
+        # ★ 轮询机制替代 Play loop="0"，避免 REST API 无法中断 Play 状态的 404 问题
+        # Twilio 每次 <Play> 结束后会重新 POST /queue-check，服务器根据状态决定接通或继续等
         logger.info(f"状态 [Queue]: 系统忙碌，号码 {caller_number} 进入排队等待。")
         wait_msg = config.wait_message or "All lines are currently busy, please hold on."
         wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
 
         twiml = f"""<Response>
             <Say voice="Polly.Amy">{wait_msg}</Say>
-            <Play loop="0">{wait_music}</Play>
+            <Play>{wait_music}</Play>
+            <Redirect method="POST">/queue-check</Redirect>
         </Response>"""
+
 
         # 启动 100 秒自动转接倒计时
         timeout_task = asyncio.create_task(
@@ -1579,9 +1584,78 @@ async def stream_ended(request: Request):
     return Response(content=twiml, media_type="application/xml")
 
 
-# =============================================================================
-# 核心业务路由：Twilio ↔ Gemini 音频桥接
-# =============================================================================
+@app.post("/queue-check")
+async def queue_check(request: Request):
+    """
+    排队状态轮询端点。
+    
+    等待中的来电每次 <Play> 音乐结束后，Twilio 会 POST 到此处。
+    根据服务器内存中该通话的状态，决定下一步动作：
+        - connecting  → AI 已空闲，立即接通（Redirect 到 /incoming-call）
+        - waiting     → 继续等待，再播一段音乐后再次轮询
+        - auto_transferred → 已超时自动转接，告知用户并 Dial 人工
+        - 其他        → 直接 Hangup
+        
+    ★ 这个机制完全避免了通过 Twilio REST API 强制更新 in-progress 通话
+      （REST API 更新 Play 状态的通话会返回 404，是 Twilio 的已知限制）。
+    """
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", "Unknown")
+    caller_number = form_data.get("From", "Unknown")
+    host = request.headers.get("host", "localhost")
+    
+    logger.info(f"[Queue-Check] CallSid={call_sid}, From={caller_number}")
+    
+    # 在 waiting_calls 里找到这个来电
+    caller = next((c for c in waiting_calls if c["call_sid"] == call_sid), None)
+    
+    if not caller:
+        # 找不到记录（可能已过期或被清理），直接挂断
+        logger.warning(f"[Queue-Check] 未找到 CallSid={call_sid} 的排队记录，挂断")
+        return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
+    
+    status = caller.get("status", "waiting")
+    logger.info(f"[Queue-Check] 当前状态: {status}, 号码: {caller.get('number')}")
+    
+    if status == "connecting":
+        # AI 已空闲且已标记接通 → 立即跳转到 /incoming-call 接入 AI
+        logger.info(f"[Queue-Check] ✅ 状态为 connecting，立即接通 AI: {caller.get('number')}")
+        return Response(
+            content=f"<Response><Redirect method=\"POST\">https://{host}/incoming-call</Redirect></Response>",
+            media_type="application/xml"
+        )
+    
+    elif status == "auto_transferred":
+        # 已超时转人工
+        logger.info(f"[Queue-Check] ⏰ 状态为 auto_transferred，转人工: {caller.get('number')}")
+        transfer_number = config.transfer_phone_number or ""
+        return Response(
+            content=f"""<Response>
+                <Say voice="Polly.Amy">Sorry for the long wait, transferring you to a human agent now.</Say>
+                <Dial>{transfer_number}</Dial>
+            </Response>""",
+            media_type="application/xml"
+        )
+    
+    elif status in ("waiting",):
+        # 仍在等待 → 再播一段音乐，然后再次轮询
+        wait_music = config.wait_music_url or "http://com.twilio.music.classical.s3.amazonaws.com/BusyStrings.mp3"
+        logger.info(f"[Queue-Check] ⏳ 状态为 waiting，继续播放等待音乐: {caller.get('number')}")
+        return Response(
+            content=f"""<Response>
+                <Play>{wait_music}</Play>
+                <Redirect method="POST">/queue-check</Redirect>
+            </Response>""",
+            media_type="application/xml"
+        )
+    
+    else:
+        # 其他状态（completed, hung_up 等）→ 挂断
+        logger.info(f"[Queue-Check] 状态为 {status}，挂断")
+        return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
+
+
+
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
