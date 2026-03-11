@@ -2550,7 +2550,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
         ) as gemini_ws:
 
             await broadcast_admin("system_log", {
-                "message": "已连接至 Google Gemini V2 Live API (WebRTC)。",
+                "message": f"已连接至 Google Gemini Live API (WebRTC) | 模型: {config.model_name}",
                 "type": "success"
             })
 
