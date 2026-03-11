@@ -304,13 +304,21 @@ def safe_queue() -> list:
 
 
 async def twilio_redirect(call_sid: str, account_sid: str, twiml: str):
-    """通过 Twilio REST API 覆盖正在进行的通话的 TwiML 指令。"""
+    """通过 Twilio REST API 覆盖正在进行的通话的 TwiML 指令。
+    
+    account_sid: 来电时 Twilio POST 的 AccountSid，用于构建 URL（通话实际归属账户）
+    config.twilio_account_sid: 认证用的主账户 SID（用于 Basic Auth，可能与来电账户不同）
+    """
+    # ★ URL 路径用来电实际归属账户（避免跨账户 404）
+    call_owner_sid = account_sid
+    # 认证 SID：若配置了主账户则用主账户，否则退用来电账户
     auth_account_sid = config.twilio_account_sid or account_sid
     auth_token = config.twilio_auth_token
     if not auth_token:
         logger.error("twilio_redirect: TWILIO_AUTH_TOKEN 未配置，无法操作通话")
         return
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{auth_account_sid}/Calls/{call_sid}.json"
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{call_owner_sid}/Calls/{call_sid}.json"
+    logger.info(f"[Queue] twilio_redirect → CallSid={call_sid}, owner={call_owner_sid}, auth={auth_account_sid}")
     try:
         import httpx
         async with httpx.AsyncClient() as client:
@@ -318,8 +326,11 @@ async def twilio_redirect(call_sid: str, account_sid: str, twiml: str):
                                      auth=(auth_account_sid, auth_token), timeout=5.0)
         if resp.status_code >= 400:
             logger.error(f"twilio_redirect failed ({resp.status_code}): {resp.text}")
+        else:
+            logger.info(f"[Queue] twilio_redirect 成功 ({resp.status_code})")
     except Exception as e:
         logger.error(f"twilio_redirect exception: {e}")
+
 
 
 async def auto_transfer_after_timeout(call_sid: str, account_sid: str, number: str):
