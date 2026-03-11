@@ -2082,7 +2082,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 await broadcast_admin("live_order_update", {
                                     "call_sid": stream_call_sid,
                                     "items": call_args.get('items', []),
-                                    "delivery_fee": call_args.get('delivery_fee', 0.0),
+                                    "delivery_fee": result.get('delivery_fee', call_args.get('delivery_fee', 0.0)),
                                     "payment_method": call_args.get('payment_method', 'unknown'),
                                     "total": result.get('total', 0.0),
                                     "subtotal": result.get('subtotal', 0.0)
@@ -2814,8 +2814,9 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                         
                                         # 同步缓存并在管理面板更新直播单小票
                                         draft_order = {
+                                            "call_sid": stream_call_sid,
                                             "items": args.get('items', []),
-                                            "delivery_fee": args.get('delivery_fee', 0.0),
+                                            "delivery_fee": result.get('delivery_fee', args.get('delivery_fee', 0.0)),
                                             "payment_method": args.get('payment_method', 'unknown'),
                                             "calculate_total_result": result.get('result', ''),
                                             "subtotal": result.get('subtotal', 0.0),

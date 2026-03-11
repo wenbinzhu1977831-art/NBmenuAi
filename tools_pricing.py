@@ -159,15 +159,23 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
         option_details = []  # 记录有价格修正的选项，用于收据展示
         enriched_options = [] # 记录包含单价修正的选项详细字典给前后端使用
         if opts and 'options' in db_item:
+            available_opts = []
+            for menu_opt_cat in db_item['options']:
+                for val in menu_opt_cat['values']:
+                    available_opts.append(val['name'])
+            logger.info(f"  [{name}] 可用选项: {available_opts}")
+            
             for user_opt in opts:  # 遍历客户选择的每个选项名称
                 found_mod = False
                 user_opt_lower = user_opt.lower()
+                logger.info(f"  [{name}] 尝试匹配选项: '{user_opt}'")
 
                 # 第一步：尝试精确匹配 (Exact Match)
                 for menu_opt_cat in db_item['options']:
                     for val in menu_opt_cat['values']:
                         if user_opt_lower == val['name'].lower():
                             mod = val.get('price_mod', 0.0)
+                            logger.info(f"  [{name}] 精确匹配成功: '{val['name']}' price_mod={mod}")
                             if mod != 0:
                                 item_total += mod
                                 sign = '+' if mod > 0 else ''
@@ -183,6 +191,7 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
                         for val in menu_opt_cat['values']:
                             if user_opt_lower in val['name'].lower():
                                 mod = val.get('price_mod', 0.0)
+                                logger.info(f"  [{name}] 模糊匹配成功: '{val['name']}' price_mod={mod}")
                                 if mod != 0:
                                     item_total += mod
                                     sign = '+' if mod > 0 else ''
@@ -194,6 +203,7 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
 
                 # 若找不到选项，也当做 0 欧元存下来，让小票能显示
                 if not found_mod:
+                    logger.warning(f"  [{name}] ⚠️ 选项未找到: '{user_opt}' (不会影响总价但选项名称会显示在小票上)")
                     enriched_options.append({'name': user_opt, 'price_adjustment': 0.0})
 
         # 计算该菜品的行总计
@@ -271,10 +281,12 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
 
     # 将所有行合并为单个字符串返回
     # AI 会将此字符串中的关键数字（总价）读给客户
+    logger.info(f"价格计算完成: subtotal={subtotal:.2f}, delivery_fee={delivery_fee:.2f}, total={total_price:.2f}")
     return {
         "result": "\n".join(receipt_lines),
         "total": total_price,
-        "subtotal": subtotal
+        "subtotal": subtotal,
+        "delivery_fee": delivery_fee
     }
 
 def calculate_total(items: list, delivery_fee: float, payment_method: str) -> dict:

@@ -1832,15 +1832,15 @@ function LiveReceipt({ liveOrder, activeCallCount, lang }) {
         <div className="mt-4 pt-2 border-t-2 border-black space-y-1 text-right">
           <div className="flex justify-between">
             <span className="font-bold">Subtotal</span>
-            <span>€{liveOrder.subtotal?.toFixed(2) || '0.00'}</span>
+            <span>€{liveOrder.subtotal != null ? Number(liveOrder.subtotal).toFixed(2) : '0.00'}</span>
           </div>
           <div className="flex justify-between">
             <span className="font-bold">Delivery Fee</span>
-            <span>+ €{liveOrder.delivery_fee?.toFixed(2) || '0.00'}</span>
+            <span>+ €{liveOrder.delivery_fee != null ? Number(liveOrder.delivery_fee).toFixed(2) : '0.00'}</span>
           </div>
           <div className="flex justify-between text-lg font-bold mt-2 pt-2 border-t border-gray-400">
             <span>TOTAL</span>
-            <span>€{liveOrder.total?.toFixed(2) || '0.00'}</span>
+            <span>€{liveOrder.total != null ? Number(liveOrder.total).toFixed(2) : '0.00'}</span>
           </div>
           <div className="flex justify-between pt-1">
             <span className="font-bold">Payment Method</span>
