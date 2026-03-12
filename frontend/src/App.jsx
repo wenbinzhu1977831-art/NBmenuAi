@@ -1114,7 +1114,7 @@ function App() {
                           </div>
                           {/* Call cards */}
                           <div className="overflow-y-auto max-h-[260px] pr-1 space-y-1.5">
-                            {recentLog.length > 0 ? recentLog.map((log, idx) => {
+                            {recentLog.length > 0 ? [...recentLog].reverse().slice(0, 10).map((log, idx) => {
                               const cfg      = STATUS_CFG[log.status] || STATUS_CFG.missed;
                               const srcIcon  = SRC_ICON[log.source] || '📞';
                               const callTime = new Date(log.joined_at * 1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
@@ -1122,22 +1122,26 @@ function App() {
                                 ? Math.round(log.ended_at - log.joined_at) + 's'
                                 : '–';
                               return (
-                                <div key={idx} className={`flex items-center gap-2 p-2 rounded-lg border bg-slate-950 border-slate-800 text-[11px] ${
-                                  log.status === 'active' ? 'ring-1 ring-emerald-500/30' : 'opacity-75'
+                                <div key={idx} className={`flex flex-col gap-0.5 p-2 rounded-lg border bg-slate-950 border-slate-800 text-[11px] ${
+                                  log.status === 'active' ? 'ring-1 ring-emerald-500/30' : 'opacity-80'
                                 }`}>
-                                  <span title={log.source === 'webrtc' ? t('tooltipWebrtc') : t('tooltipTwilio')}>{srcIcon}</span>
-                                  <span className="font-mono text-slate-300 flex-1 truncate">{log.number}</span>
-                                  <span className="text-slate-600">{callTime}</span>
-                                  {log.ended_at && <span className="text-slate-600">{duration}</span>}
-                                  <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium whitespace-nowrap ${cfg.cls}`}>{cfg.label}</span>
-                                  {/* Order outcome */}
-                                  {log.status === 'completed' && (
-                                    <span title={log.order_finalized === true ? t('tooltipOrderDone') : log.order_finalized === false ? t('tooltipOrderMissed') : t('tooltipNoOrder')}>
-                                      {log.order_finalized === true ? '✅' : log.order_finalized === false ? '⚠️' : '—'}
-                                    </span>
-                                  )}
-                                  {/* Transfer indicator */}
-                                  {log.transferred && <span title={t('tooltipTransferred')}>🔀</span>}
+                                  {/* Line 1: icon + number + time */}
+                                  <div className="flex items-center gap-1.5 min-w-0">
+                                    <span title={log.source === 'webrtc' ? t('tooltipWebrtc') : t('tooltipTwilio')}>{srcIcon}</span>
+                                    <span className="font-mono text-slate-200 flex-1 truncate">{log.number}</span>
+                                    <span className="text-slate-500 shrink-0">{callTime}</span>
+                                    {log.ended_at && <span className="text-slate-600 shrink-0">{duration}</span>}
+                                  </div>
+                                  {/* Line 2: status + order outcome + transfer */}
+                                  <div className="flex items-center gap-1.5 pl-5">
+                                    <span className={`px-1.5 py-0.5 rounded border text-[10px] font-medium whitespace-nowrap ${cfg.cls}`}>{cfg.label}</span>
+                                    {log.status === 'completed' && (
+                                      <span title={log.order_finalized === true ? t('tooltipOrderDone') : log.order_finalized === false ? t('tooltipOrderMissed') : t('tooltipNoOrder')}>
+                                        {log.order_finalized === true ? '✅' : log.order_finalized === false ? '⚠️' : '—'}
+                                      </span>
+                                    )}
+                                    {log.transferred && <span title={t('tooltipTransferred')}>🔀</span>}
+                                  </div>
                                 </div>
                               );
                             }) : (
@@ -1146,8 +1150,8 @@ function App() {
                                 <span className="text-xs">{t('noCallLog')}</span>
                               </div>
                             )}
-                            {callLog.length > 20 && (
-                              <p className="text-center text-[10px] text-slate-600 pt-1">{t('callLogMoreFmt').replace('{n}', callLog.length)}</p>
+                            {recentLog.length > 10 && (
+                              <p className="text-center text-[10px] text-slate-600 pt-1">{t('callLogMoreFmt').replace('{n}', recentLog.length)}</p>
                             )}
                           </div>
                         </div>
