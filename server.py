@@ -2657,6 +2657,22 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
 
                             function_responses = []
 
+                            # === 方案C Part B: 工具调用期间保活心跳 ===
+                            # 每3秒向浏览器发一次ping，防止静默期被判定为断线
+                            _ws_keepalive_stop = asyncio.Event()
+                            async def _ws_keepalive_fn():
+                                while not _ws_keepalive_stop.is_set():
+                                    try:
+                                        await asyncio.wait_for(_ws_keepalive_stop.wait(), timeout=3.0)
+                                    except asyncio.TimeoutError:
+                                        try:
+                                            await websocket.send_json({"event": "ping"})
+                                        except Exception:
+                                            _ws_keepalive_stop.set()
+                                            break
+                            _ws_keepalive_task = asyncio.create_task(_ws_keepalive_fn())
+
+
                             for call in function_calls:
                                 call_id = call['id']
                                 name = call['name']
@@ -2789,6 +2805,10 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                 })
 
                             # 将工具结果发回给 Gemini
+                            # 停止保活任务
+                            _ws_keepalive_stop.set()
+                            await asyncio.gather(_ws_keepalive_task, return_exceptions=True)
+
                             if function_responses:
                                 stop_typing_sound()
                                 start_typing_sound()

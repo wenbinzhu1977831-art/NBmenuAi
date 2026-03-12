@@ -131,4 +131,9 @@ async def stream_audio_to_websocket(ws, format: str, cancel_event: asyncio.Event
                 pass # 到时未触发取消，说明要继续循环
                 
     except Exception as e:
-        logger.error(f"音频注入视频流传输失败: {e}")
+        err_str = str(e).lower()
+        # WebSocket closed is normal exit, downgrade to INFO
+        if any(k in err_str for k in ["websocket.send", "websocket.close", "after sending", "close"]):
+            logger.info("Audio injection task ended (WebSocket already closed - normal exit)")
+        else:
+            logger.error(f"Audio injection stream failed: {e}")
