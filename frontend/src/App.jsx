@@ -2010,6 +2010,7 @@ function OrdersView({ orders, selectedOrder, setSelectedOrder, onDeleteOrder, t 
                     } catch(e) {}
                     if (!ts || ts.length === 0) return <div className="text-center text-slate-600 py-10">{t('noTranscript')}</div>;
                     
+                    return ts.map((msg, i) => (
                        <div key={i} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
                          <span className="text-[10px] text-slate-500 mb-1 px-1">
                              {msg.role === 'user' ? t('userRole') : t('aiRole')}
