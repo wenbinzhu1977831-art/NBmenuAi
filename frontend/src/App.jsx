@@ -578,6 +578,18 @@ function App() {
           });
         } else if (msg.event === 'live_order_update') {
           setLiveOrder(msg.data);
+        } else if (msg.event === 'gemini_disconnect') {
+          // Gemini API WS closed unexpectedly - show error in transcript
+          const sid = activeViewCallSid || Object.keys(transcripts).pop() || '__system__';
+          setTranscripts(prev => ({
+            ...prev,
+            [sid]: [...(prev[sid] || []), {
+              id: Date.now(),
+              role: 'system',
+              text: '⚠️ AI session disconnected unexpectedly. Please call again.',
+              is_final: true
+            }]
+          }));
         }
       } catch (err) {
         console.error('WS parse error', err);

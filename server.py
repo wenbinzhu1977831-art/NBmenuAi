@@ -2405,6 +2405,12 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
         # 生成唯一的模拟通话 SID（避免与真实 Twilio CallSid 冲突）
         stream_call_sid = f"web_{uuid.uuid4().hex[:8]}"
 
+        # 新通话开始：清空实时订单小票
+        await broadcast_admin("live_order_update", {
+            "call_sid": stream_call_sid, "items": [], "subtotal": 0.0,
+            "total": 0.0, "delivery_fee": 0.0, "payment_method": "", "calculate_total_result": ""
+        })
+
         logger.info(f"Web 模拟通话开始，虚拟号码: {customer_number}")
 
         # 建立与 Gemini 的 WebSocket 连接
@@ -2825,7 +2831,14 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                 })
 
                 except ConnectionClosed:
-                    logger.info("Gemini (Web) WebSocket 断开")
+                    logger.info("Gemini (Web) WebSocket 断开（Gemini 端关闭会话）")
+                    try:
+                        await websocket.send_json({
+                            "event": "gemini_disconnect",
+                            "message": "AI session disconnected unexpectedly. Please call again."
+                        })
+                    except Exception:
+                        pass  # 浏览器也已断开，忽略
                 except Exception as e:
                     import traceback
                     logger.error(f"Gemini (Web) 接收任务异常: {e}\n{traceback.format_exc()}")
@@ -2834,6 +2847,19 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
             task_a = asyncio.create_task(receive_from_browser())
             task_b = asyncio.create_task(receive_from_gemini())
 
+            # Fix B: Gemini WS 保活心跳 — 每10秒向 Gemini API 发 ping 防止超时
+            async def gemini_ws_keepalive():
+                try:
+                    while True:
+                        await asyncio.sleep(10)
+                        try:
+                            await gemini_ws.ping()
+                        except Exception:
+                            break  # Gemini WS 已关闭，停止心跳
+                except asyncio.CancelledError:
+                    pass
+            task_c = asyncio.create_task(gemini_ws_keepalive())
+
             # 等待任意一个任务完成，然后取消另一个
             done, pending = await asyncio.wait(
                 [task_a, task_b],
@@ -2841,6 +2867,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
             )
             for p in pending:
                 p.cancel()
+            task_c.cancel()  # 停止 Gemini WS 保活心跳
 
     except Exception as e:
         logger.error(f"Web 模拟通话全局异常: {e}")
