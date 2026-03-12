@@ -2558,11 +2558,6 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                         text_content = part['text']
                                         start_typing_sound()
                                         logger.info(f"Gemini (Web) 文本响应: {text_content}")
-                                        call_transcript.append({
-                                            "role": "thought", 
-                                            "text": f"💭 思考过程: {text_content}", 
-                                            "timestamp": time.time()
-                                        })
                                         await broadcast_admin("transcript", {
                                             "call_sid": stream_call_sid,
                                             "role": "thought",

@@ -2006,22 +2006,20 @@ function OrdersView({ orders, selectedOrder, setSelectedOrder, onDeleteOrder, t 
                     } catch(e) {}
                     if (!ts || ts.length === 0) return <div className="text-center text-slate-600 py-10">{t('noTranscript')}</div>;
                     
-                    return ts.map((msg, i) => (
+                    return ts.filter(msg => msg.role !== 'thought').map((msg, i) => (
                        <div key={i} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
                          <span className="text-[10px] text-slate-500 mb-1 px-1">
                              {msg.role === 'user' ? t('userRole') : t('aiRole')}
                          </span>
-                         <div className={`px-4 py-2 rounded-2xl max-w-[85%] text-sm leading-relaxed ${
-                           msg.role === 'user' 
-                              ? 'bg-indigo-600/80 text-white rounded-tr-none' 
-                              : msg.role === 'thought'
-                                ? 'bg-slate-800/50 text-slate-400 italic text-xs border border-slate-700/50 rounded-tl-none'
-                                : 'bg-slate-800 text-slate-200 border border-slate-700 rounded-tl-none'
+                         <div className={`px-4 py-2 rounded-2xl max-w-[85%] text-sm leading-relaxed whitespace-pre-wrap ${
+                           msg.role === 'user'
+                              ? 'bg-indigo-600/80 text-white rounded-tr-none'
+                              : 'bg-slate-800 text-slate-200 border border-slate-700 rounded-tl-none'
                          }`}>
                            {msg.text}
                          </div>
                        </div>
-                    ));
+                     ));
                   })()}
                 </div>
               </div>
