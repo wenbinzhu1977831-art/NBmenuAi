@@ -2435,6 +2435,9 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                 "caller_number": customer_number,
                 "caller_name": caller_name
             }
+            # 写入呼入日志（WebRTC 通话），立即广播给管理面板
+            call_log_add(stream_call_sid, customer_number, "webrtc")
+            await broadcast_admin("call_log_update", safe_call_log())
             await broadcast_admin("call_start", {
                 "call_sid": stream_call_sid,
                 "caller": customer_number,

@@ -483,15 +483,15 @@ function App() {
             const callEntries = [...(prev[call_sid] || [])];
 
             if ((role === 'user' || role === 'ai') && !is_final) {
-              // 流式 chunk：如果该路最后一条是同角色的未完成条目，直接更新文本
+              // 流式 chunk（服务端发送增量）：必须累加到已有文本后面
               const lastIdx = callEntries.length - 1;
               if (lastIdx >= 0 && callEntries[lastIdx].role === role && !callEntries[lastIdx].is_final) {
-                const prevText = callEntries[lastIdx].text;
-                const delta = text.slice(prevText.length); // 新增的字符
-                callEntries[lastIdx] = { ...callEntries[lastIdx], text, delta };
+                const accText = callEntries[lastIdx].text + text; // 就是 prevText + 新chunk
+                callEntries[lastIdx] = { ...callEntries[lastIdx], text: accText };
                 return { ...prev, [call_sid]: callEntries };
               }
-              return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: false, delta: text }] };
+              // 新开一条流式条目
+              return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: false }] };
             }
 
             if ((role === 'user' || role === 'ai') && is_final) {
@@ -1758,7 +1758,7 @@ function TypewriterText({ text, isStreaming }) {
         }
         return target.slice(0, prev.length + 1);
       });
-    }, 25);
+    }, 18); // 18ms ≈ 55字/秒
 
     return () => {
       if (timerRef.current) {
