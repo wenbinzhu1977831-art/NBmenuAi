@@ -1440,8 +1440,24 @@ async def stream_ended(request: Request):
     return Response(content=twiml, media_type="application/xml")
 
 
+@app.post("/call-status")
+async def call_status(request: Request):
+    """
+    Twilio 通话状态回调（StatusCallback）处理器。
+    Twilio 在通话状态变化时（ringing, in-progress, completed 等）POST 到此端点。
+    只需返回 204 No Content 告知 Twilio 已收到即可。
+    """
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", "unknown")
+    status = form_data.get("CallStatus", "unknown")
+    logger.info(f"Twilio 通话状态回调: SID={call_sid}, status={status}")
+    return Response(status_code=204)
+
+
+
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
+
     """
     Twilio 媒体流 WebSocket 处理器，是整个系统的核心。
 

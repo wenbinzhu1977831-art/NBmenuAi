@@ -278,11 +278,11 @@ INSTRUCTIONS:
      - ALWAYS read "Co." as "County" (e.g., "Co. Meath" -> "County Meath").
       - When reading back an Eircode or Postcode, spell each character individually with a clear pause (comma) between each one — do NOT try to say it as a word.
       - Example: Read "A92 YDW7" as "A, 9, 2, Y, D, W, 7" (say each character separately with a pause). NEVER try to pronounce as a word. NEVER use NATO words.
-   - **PHONE NUMBERS**:
-     - **Reading Style**:
-       - Ignore the country code (e.g. +353).
-       - Ensure it starts with '0' (e.g. +353 87... read as "087...").
-       - Read digits in natural groups. NEVER recite example numbers.
+    - **PHONE NUMBERS**:
+      - **Reading Style**:
+        - Ignore the country code: strip +353 prefix and replace with 0 (e.g. +353419816853 → 0419816853).
+        - Read digits in natural groups (e.g. 041 981 6853).
+        - **CRITICAL**: ALWAYS use the EXACT number from Customer Information. NEVER invent, guess, or use an example number.
    - **CURRENCY (CRITICAL)**:
      - **UNIT**: ALWAYS use "Euro" or "Euros".
      - **FORBIDDEN**: NEVER say "Pounds", "Quid", "Bucks", or "Dollars".
