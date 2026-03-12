@@ -167,7 +167,8 @@ def init_db():
             engine = create_engine(
                 "postgresql+pg8000://",
                 creator=getconn,
-                pool_pre_ping=True,
+                pool_pre_ping=True,   # 每次取连接前先 ping，检测陈旧连接
+                pool_recycle=1800,    # 30分钟强制回收连接（Cloud SQL 空闲超时约10分钟）
                 pool_size=5,
                 max_overflow=2,
             )
