@@ -30,3 +30,6 @@ settings.json
 
 # Ignore MacOS noise
 .DS_Store
+
+# Windows binary - not needed in Linux container
+cloud-sql-proxy.exe

@@ -11,7 +11,7 @@
 ```
 Gemini 3 Live API/
 ├── server.py               # 主网关（FastAPI + WebSocket 桥接）
-├── boot.py                 # Cloud Run 启动包装器
+├── boot.py                 # Cloud Run 诊断启动包装器（备用，当前未启用）
 ├── config.py               # 动态配置（热重载，无需重启）
 ├── database.py             # SQLite ORM（客户 / 订单 / 菜单）
 ├── models.py               # SQLAlchemy 数据模型定义
@@ -28,7 +28,7 @@ Gemini 3 Live API/
 ├── 键盘.wav                 # 工具等待音效
 ├── Dockerfile              # 容器镜像定义
 ├── docker-compose.yml      # 本地 Docker 开发
-├── cloud_run_env.yaml      # Cloud Run 环境变量模板
+├── cloud_run_env.yaml      # ⚠️ 环境变量参考（含密钥！本地参考用，不应提交到 Git）
 ├── requirements.txt        # Python 依赖
 ├── .env / .env.example     # 环境变量（本地）
 ├── frontend/               # React 管理控制台
@@ -36,12 +36,7 @@ Gemini 3 Live API/
 │   └── src/components/
 │       ├── WebCallSimulator.jsx   # 网页麦克风通话模拟器
 │       └── MenuGUI.jsx            # 菜单可视化编辑器
-└── scripts/                # 运维工具脚本
-    ├── migrate_orders_only.py     # 订单数据迁移
-    ├── upload_to_cloud_sql.py     # 上传数据到 Cloud SQL
-    ├── verify_admin_login.py      # 验证管理员登录
-    ├── verify_menu.py             # 菜单完整性检查
-    └── test_*.py                  # 单元测试脚本
+└── scripts/                # 运维工具脚本（临时/测试用）
 ```
 
 ---

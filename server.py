@@ -57,7 +57,6 @@ import asyncio
 import audioop       # 音频编解码（mu-law ↔ PCM 转换）
 import logging
 import re               # ctrl-char filter for outputTranscription
-import timeit        # 精确计时（保留导入，部分调试场景使用）
 import uuid          # 生成唯一订单 ID
 import time
 from datetime import datetime, timedelta
@@ -1244,7 +1243,6 @@ async def clear_logs():
 # 管理端 API：电话排队区手动转接 (Emergency Transfer)
 # =============================================================================
 
-from pydantic import BaseModel
 
 # =============================================================================
 # 核心业务路由：Twilio 电话接入
