@@ -483,22 +483,26 @@ function App() {
             const callEntries = [...(prev[call_sid] || [])];
 
             if ((role === 'user' || role === 'ai') && !is_final) {
-              // 流式 chunk（服务端发送增量）：必须累加到已有文本后面
-              const lastIdx = callEntries.length - 1;
-              if (lastIdx >= 0 && callEntries[lastIdx].role === role && !callEntries[lastIdx].is_final) {
-                const accText = callEntries[lastIdx].text + text; // 就是 prevText + 新chunk
-                callEntries[lastIdx] = { ...callEntries[lastIdx], text: accText };
+              // 流式 chunk：向后搜索最近一条未完成的同角色条目（thought 等条目不影响匹配）
+              let targetIdx = -1;
+              for (let j = callEntries.length - 1; j >= 0; j--) {
+                if (callEntries[j].role === role && !callEntries[j].is_final) { targetIdx = j; break; }
+              }
+              if (targetIdx >= 0) {
+                callEntries[targetIdx] = { ...callEntries[targetIdx], text: callEntries[targetIdx].text + text };
                 return { ...prev, [call_sid]: callEntries };
               }
-              // 新开一条流式条目
               return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: false }] };
             }
 
             if ((role === 'user' || role === 'ai') && is_final) {
-              // 完成 chunk：封厕最后一条未完成条目
-              const lastIdx = callEntries.length - 1;
-              if (lastIdx >= 0 && callEntries[lastIdx].role === role && !callEntries[lastIdx].is_final) {
-                callEntries[lastIdx] = { ...callEntries[lastIdx], text, is_final: true };
+              // 完成：向后搜索最近一条未完成的同角色条目并封存（避免 thought 打断合并）
+              let targetIdx = -1;
+              for (let j = callEntries.length - 1; j >= 0; j--) {
+                if (callEntries[j].role === role && !callEntries[j].is_final) { targetIdx = j; break; }
+              }
+              if (targetIdx >= 0) {
+                callEntries[targetIdx] = { ...callEntries[targetIdx], text, is_final: true };
                 return { ...prev, [call_sid]: callEntries };
               }
               return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: true }] };
@@ -2006,7 +2010,6 @@ function OrdersView({ orders, selectedOrder, setSelectedOrder, onDeleteOrder, t 
                     } catch(e) {}
                     if (!ts || ts.length === 0) return <div className="text-center text-slate-600 py-10">{t('noTranscript')}</div>;
                     
-                    return ts.filter(msg => msg.role !== 'thought').map((msg, i) => (
                        <div key={i} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
                          <span className="text-[10px] text-slate-500 mb-1 px-1">
                              {msg.role === 'user' ? t('userRole') : t('aiRole')}
