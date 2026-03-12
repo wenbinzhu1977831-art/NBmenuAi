@@ -430,6 +430,7 @@ def save_order(order_data: dict):
 
     except Exception as e:
         logger.error(f"保存订单至数据库时出错: {e}")
+        import traceback; logger.error(traceback.format_exc())
 
 
 def update_customer_history(

@@ -56,6 +56,7 @@ import base64
 import asyncio
 import audioop       # 音频编解码（mu-law ↔ PCM 转换）
 import logging
+import re               # ctrl-char filter for outputTranscription
 import timeit        # 精确计时（保留导入，部分调试场景使用）
 import uuid          # 生成唯一订单 ID
 import time
@@ -281,7 +282,7 @@ def safe_call_log() -> list:
             "order_finalized": r["order_finalized"],
             "transferred":     r["transferred"],
         }
-        for r in call_log
+        for r in reversed(call_log)  # 最新通话排在最前面
     ]
 
 
@@ -1761,6 +1762,7 @@ async def handle_media_stream(websocket: WebSocket):
                         # --- AI 输出转录（AI 说了什么）---
                         if 'outputTranscription' in server_content:
                             text_chunk = server_content['outputTranscription'].get('text', '')
+                            text_chunk = re.sub(r'<ctrl\d+>', '', text_chunk).strip()  # filter Gemini internal tokens
                             if text_chunk:
                                 current_ai_transcript += text_chunk
                                 # 青色输出到服务器终端（实时流式输出，不换行）
@@ -2588,6 +2590,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                             # AI 输出转录
                             if 'outputTranscription' in server_content:
                                 text_chunk = server_content['outputTranscription'].get('text', '')
+                                text_chunk = re.sub(r'<ctrl\d+>', '', text_chunk).strip()  # filter Gemini internal tokens
                                 if text_chunk:
                                     current_ai_transcript_web += text_chunk
                                     print(f"\033[96m{text_chunk}\033[0m", end="", flush=True)
@@ -2703,8 +2706,15 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                         addr = args.get('address', '')
                                         result = {"delivery_fee": database.get_delivery_fee(addr)}
                                     elif name == 'end_call':
+                                        # [防重复] guard: Gemini 有时会重复发 end_call，只处理第一次
+                                        if order_finalized:
+                                            result = {"status": "success", "note": "Order already saved. Say only Goodbye."}
+                                            logger.warning("⚠️ 检测到重复 end_call，已忽略：避免重复归档")
+                                            continue  # 跳过重复 end_call 处理
+                                        else:
+                                            order_finalized = True
                                         # 保存模拟订单（标记来源为 "AI (WebSim)"）
-                                        order_finalized = True
+                                        # 保存模拟订单（标记来源为 "AI (WebSim)"）
                                         items = args.get('items', [])
                                         total = args.get('total_value', args.get('total_amount', 0))
                                         s_type = args.get('service_type', 'Pickup')
@@ -2759,7 +2769,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                             # [BUG FIX] save_order 成功后必须设置 result，
                                             # 否则会触发下方 "if result is None" 分支，
                                             # 错误地向 Gemini 返回 "Function not implemented"
-                                            result = {"status": "success", "order_id": order_id}
+                                            result = {"status": "success", "order_id": order_id, "note": "Order saved. Now say ONLY a brief Goodbye - do NOT repeat the total or delivery time."}
 
                                         except Exception as e:
                                             logger.error(f"Web模拟订单归档失败: {e}")

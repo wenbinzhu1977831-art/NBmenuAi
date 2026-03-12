@@ -1862,6 +1862,14 @@ function LiveReceipt({ liveOrder, activeCallCount, lang }) {
           )}
         </div>
 
+        {/* Order Notes */}
+        {liveOrder.note && (
+          <div className="mt-3 pt-2 border-t border-dashed border-gray-400 text-xs">
+            <span className="font-bold">NOTE:</span>
+            <p className="mt-0.5 italic text-gray-600 break-words">{liveOrder.note}</p>
+          </div>
+        )}
+
         {/* Totals */}
         <div className="mt-4 pt-2 border-t-2 border-black space-y-1 text-right">
           <div className="flex justify-between">
@@ -1951,6 +1959,12 @@ function OrdersView({ orders, selectedOrder, setSelectedOrder, onDeleteOrder, t 
                           <span>🚚 {o.service_type} ({o.delivery_area})</span>
                           <span>💳 {o.payment_method}</span>
                         </div>
+                        {(o.notes || o.note) && (
+                          <div className="text-xs text-amber-400/80 mt-1 flex items-center gap-1 max-w-xs">
+                            <span>📝</span>
+                            <span className="truncate">{o.notes || o.note}</span>
+                          </div>
+                        )}
                       </div>
                       <div className="text-right flex flex-col items-end gap-1.5">
                         <div className="text-lg font-bold text-green-400">€{parseFloat(o.total_value).toFixed(2)}</div>
