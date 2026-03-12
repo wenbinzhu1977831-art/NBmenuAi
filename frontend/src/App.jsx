@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import { 
   Settings, Bot, PhoneCall, ListOrdered, FileText, 
@@ -486,10 +486,12 @@ function App() {
               // 流式 chunk：如果该路最后一条是同角色的未完成条目，直接更新文本
               const lastIdx = callEntries.length - 1;
               if (lastIdx >= 0 && callEntries[lastIdx].role === role && !callEntries[lastIdx].is_final) {
-                callEntries[lastIdx] = { ...callEntries[lastIdx], text };
+                const prevText = callEntries[lastIdx].text;
+                const delta = text.slice(prevText.length); // 新增的字符
+                callEntries[lastIdx] = { ...callEntries[lastIdx], text, delta };
                 return { ...prev, [call_sid]: callEntries };
               }
-              return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: false }] };
+              return { ...prev, [call_sid]: [...callEntries, { id: Date.now() + Math.random(), role, text, is_final: false, delta: text }] };
             }
 
             if ((role === 'user' || role === 'ai') && is_final) {
@@ -1286,8 +1288,7 @@ function App() {
                                 <div className="text-xs mb-1 opacity-50 flex items-center gap-1">
                                   {msg.role === 'user' ? <User size={10}/> : <Bot size={10}/>} {msg.role === 'user' ? (lang==='zh' ? '客户' : 'Caller') : 'AI'}
                                 </div>
-                                {msg.text}
-                                {msg.role === 'user' && !msg.is_final && <span className="animate-pulse">...</span>}
+                                <TypewriterText text={msg.text} isStreaming={!msg.is_final} />
                               </div>
                             )}
                           </div>
@@ -1723,6 +1724,67 @@ function AutoScrollTrigger({ transcripts }) {
     }
   }, [transcripts]);
   return null;
+}
+
+// ----------------------------------------------------------------------
+// 辅助组件：打字机效果文本，针对流式转录条目
+// ----------------------------------------------------------------------
+function TypewriterText({ text, isStreaming }) {
+  const [displayed, setDisplayed] = useState('');
+  const targetRef = useRef(text);
+  const timerRef = useRef(null);
+
+  useEffect(() => {
+    targetRef.current = text;
+
+    // 如果已显示文本超过目标（不应出现），直接重置
+    if (displayed.length > text.length) {
+      setDisplayed(text);
+      return;
+    }
+
+    // 如果已显示的和目标一致，无需动画
+    if (displayed === text) return;
+
+    // 启动逐字显示计时器，25ms/局 ≈ 40字/秒
+    if (timerRef.current) return; // 已经在跑了
+    timerRef.current = setInterval(() => {
+      setDisplayed(prev => {
+        const target = targetRef.current;
+        if (prev.length >= target.length) {
+          clearInterval(timerRef.current);
+          timerRef.current = null;
+          return target;
+        }
+        return target.slice(0, prev.length + 1);
+      });
+    }, 25);
+
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [text]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 如果已完成（is_final）直接显示全文
+  useEffect(() => {
+    if (!isStreaming) {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      setDisplayed(text);
+    }
+  }, [isStreaming, text]);
+
+  return (
+    <>
+      {displayed}
+      {isStreaming && <span className="stream-cursor" />}
+    </>
+  );
 }
 
 // ----------------------------------------------------------------------
