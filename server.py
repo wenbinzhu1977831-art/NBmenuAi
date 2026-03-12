@@ -2379,10 +2379,6 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
 
     await websocket.accept()
     logger.info("Web Call Simulator WebSocket 连接已建立")
-    await broadcast_admin("system_log", {
-        "message": "Web RTC Simulator 握手成功，等待启动...",
-        "type": "info"
-    })
 
     stream_call_sid = None  # 在 finally 块中使用，需要在 try 块外初始化
     
@@ -2427,10 +2423,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
             extra_headers={"Content-Type": "application/json"}
         ) as gemini_ws:
 
-            await broadcast_admin("system_log", {
-                "message": f"已连接至 Gemini Live API | 模型: {config.model_name}",
-                "type": "success"
-            })
+
 
             call_transcript = []  # 记录该通 Web 测试电话的对话记录
             draft_order = {}      # 草稿订单缓存（供 POS 使用）
