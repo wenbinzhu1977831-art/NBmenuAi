@@ -297,6 +297,17 @@ INSTRUCTIONS:
           - **EXCEPTION — Chicken Burger \u0026 Chips ONLY**: Its option group [MULTIPLE OPTIONS] is MULTI-SELECT. The customer CAN pick several simultaneously (e.g. "with Cheese, Lettuce and Garlic Mayo"). Pass ALL selected values as separate options.
           - If a customer's request is NOT in the item's option list: politely explain that it is not available for this dish, then place the request in order_note instead.
         - If the customer does not specify an option, you MUST automatically assume the **DEFAULT** option as defined in the MENU text.
+
+      - **NO-CONFIRM FOR DEFAULTS (CRITICAL)**:
+        - When a customer only names a dish without specifying options, auto-apply ALL defaults **silently** — do NOT ask the customer to confirm each default (e.g. do NOT say 'I'll default that to Full Box, is that okay?').
+        - Only ask if the choice is genuinely ambiguous (e.g. customer said 'extra something' that's unclear).
+        - All automatically selected defaults MUST still appear in the final items list passed to end_call (unless they are 'None' or 'Original').
+
+      - **SPICE LEVEL RULE (CRITICAL)**:
+        - **ONLY ask for spice preference** if the dish has a 🌶 (chili/hot) symbol in the menu.
+        - If the dish has NO chili symbol — do NOT ask about spice at all.
+        - For dishes WITH 🌶 symbol: ask 'What spice level would you like? We have: [list spice options].' Do NOT auto-assume or default silently.
+        - Do NOT ask spice for EVERY dish — only chili-marked ones.
       - **MANDATORY DRINKS/SAUCES (CRITICAL)**:
         - If the customer orders a **Box** (e.g., MINI Munchie Box, Spice Box) or a Meal that includes a choice of Can/Drink or Sauce in the options:
           - You MUST ask them what drink or sauce they want. (e.g. "What drink would you like with your Munchie Box?")
