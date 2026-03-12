@@ -1483,10 +1483,6 @@ async def handle_media_stream(websocket: WebSocket):
     """
     await websocket.accept()
     logger.info("Twilio WebSocket 连接已建立")
-    await broadcast_admin("system_log", {
-        "message": "Twilio WebSocket 握手成功，等待来电...",
-        "type": "info"
-    })
 
     # 建立与 Google Gemini Live API 的 WebSocket 连接
     # gemini_ws_uri 包含 API Key，在 config.gemini_ws_uri 属性中动态生成
@@ -1495,10 +1491,6 @@ async def handle_media_stream(websocket: WebSocket):
         extra_headers={"Content-Type": "application/json"}
     ) as gemini_ws:
 
-        await broadcast_admin("system_log", {
-            "message": "已连接至 Google Gemini V2 Live API。",
-            "type": "success"
-        })
 
         # --- 共享状态变量（在两个子任务间共享）---
         stream_sid = None        # Twilio 媒体流 SID（发送音频时必须携带）
@@ -2198,7 +2190,6 @@ async def handle_media_stream(websocket: WebSocket):
                         "customer_phone": customer_number,
                         "contact_phone": None,
                         "customer_name": customer_info.get('name', 'Unknown') if customer_info else 'Unknown',
-                        "service_type": "Unknown (Call Dropped)",
                         "address": customer_info.get('address', 'Unknown') if customer_info else 'Unknown',
                         "delivery_area": "Unknown",
                         "items": draft_order.get('items', []) if draft_order else [],
@@ -2206,7 +2197,8 @@ async def handle_media_stream(websocket: WebSocket):
                         "payment_method": draft_order.get('payment_method', 'Unknown') if draft_order else 'Unknown',
                         "delivery_fee": draft_order.get('delivery_fee', 0.0) if draft_order else 0.0,
                         "note": f"⚠️ 通话意外断开。报价详情: {draft_order.get('calculate_total_result', '无报价') if draft_order else '无报价'}",
-                        "source": "AI (Incomplete - Call Dropped)",
+                        "service_type": "Dropped",
+                        "source": "AI-Incomplete",
                         "transcript": call_transcript
                     }
                     database.save_order(rescue_record)
@@ -2420,7 +2412,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
         ) as gemini_ws:
 
             await broadcast_admin("system_log", {
-                "message": f"已连接至 Google Gemini Live API (WebRTC) | 模型: {config.model_name}",
+                "message": f"已连接至 Gemini Live API | 模型: {config.model_name}",
                 "type": "success"
             })
 
@@ -2848,17 +2840,6 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
             task_b = asyncio.create_task(receive_from_gemini())
 
             # Fix B: Gemini WS 保活心跳 — 每10秒向 Gemini API 发 ping 防止超时
-            async def gemini_ws_keepalive():
-                try:
-                    while True:
-                        await asyncio.sleep(10)
-                        try:
-                            await gemini_ws.ping()
-                        except Exception:
-                            break  # Gemini WS 已关闭，停止心跳
-                except asyncio.CancelledError:
-                    pass
-            task_c = asyncio.create_task(gemini_ws_keepalive())
 
             # 等待任意一个任务完成，然后取消另一个
             done, pending = await asyncio.wait(
@@ -2867,7 +2848,6 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
             )
             for p in pending:
                 p.cancel()
-            task_c.cancel()  # 停止 Gemini WS 保活心跳
 
     except Exception as e:
         logger.error(f"Web 模拟通话全局异常: {e}")
@@ -2883,7 +2863,6 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                     "customer_phone": customer_number,
                     "contact_phone": None,
                     "customer_name": customer_info.get('name', 'Web Tester') if customer_info else 'Web Tester',
-                    "service_type": "Unknown (Web Call Dropped)",
                     "address": customer_info.get('address', 'Unknown') if customer_info else 'Unknown',
                     "delivery_area": "Unknown",
                     "items": draft_order.get('items', []) if draft_order else [],
@@ -2891,7 +2870,8 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                     "payment_method": draft_order.get('payment_method', 'Unknown') if draft_order else 'Unknown',
                     "delivery_fee": draft_order.get('delivery_fee', 0.0) if draft_order else 0.0,
                     "note": f"⚠️ 模拟通话断开。报价详情: {draft_order.get('calculate_total_result', '无报价') if draft_order else '无报价'}",
-                    "source": "AI (WebSim Incomplete)",
+                    "service_type": "Dropped",
+                    "source": "AI-Incomplete",
                     "transcript": json.dumps(call_transcript)
                 }
                 async with _db_write_lock:
