@@ -1760,7 +1760,7 @@ async def handle_media_stream(websocket: WebSocket):
                         # --- AI 输出转录（AI 说了什么）---
                         if 'outputTranscription' in server_content:
                             text_chunk = server_content['outputTranscription'].get('text', '')
-                            text_chunk = re.sub(r'<ctrl\d+>', '', text_chunk).strip()  # filter Gemini internal tokens
+                            text_chunk = re.sub(r'<ctrl\d+>', '', text_chunk)  # filter Gemini internal tokens
                             if text_chunk:
                                 current_ai_transcript += text_chunk
                                 # 青色输出到服务器终端（实时流式输出，不换行）
@@ -2583,7 +2583,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                             # AI 输出转录
                             if 'outputTranscription' in server_content:
                                 text_chunk = server_content['outputTranscription'].get('text', '')
-                                text_chunk = re.sub(r'<ctrl\d+>', '', text_chunk).strip()  # filter Gemini internal tokens
+                                text_chunk = re.sub(r'<ctrl\d+>', '', text_chunk)  # filter Gemini internal tokens
                                 if text_chunk:
                                     current_ai_transcript_web += text_chunk
                                     print(f"\033[96m{text_chunk}\033[0m", end="", flush=True)
