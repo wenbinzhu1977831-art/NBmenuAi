@@ -50,32 +50,17 @@ definition = {
                 "properties": {
 
                     # 订购菜品列表
-                    # 每个元素是一个对象，必须包含：
-                    #   - name (string)：菜品名称，需与菜单严格一致
-                    #   - quantity (int)：数量
-                    #   - options (list of string, 可选)：所选选项名称列表
-                    #     例如 ["Large", "Extra Hot", "Fried Rice"]
+                    # 修改为简单的字符串列表，防止原生语音大模型在生成深层嵌套 JSON 时触发 Google 后端 1011 崩溃
                     "items": {
                         "type": "array",
-                        "description": (
-                            "List of items ordered. Each item is an object with "
-                            "'name' (string), 'quantity' (int), and 'options' (list of strings)."
-                        ),
                         "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "quantity": {"type": "integer"},
-                                "options": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": (
-                                        "Selected options like 'Large', 'Extra Hot', 'Fried Rice'."
-                                    )
-                                }
-                            },
-                            "required": ["name", "quantity"]
-                        }
+                            "type": "string"
+                        },
+                        "description": (
+                            "List of items ordered with options and quantities. "
+                            "Format each string as: '[Quantity]x [Item Name] (with [Options])'. "
+                            "Example: '2x Large Munchie Box (with Fried Rice, Extra Hot)', '1x Can of Coke'"
+                        )
                     },
 
                     # 配送费（欧元）
@@ -113,7 +98,7 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
         3. 若折扣激活且折扣值 > 0，计算折扣金额并扣除
         4. 若 delivery_fee > 0，加入配送费
         5. 若支付方式为 "card"，加入刷卡附加费
-        6. 检查配送最低金额限制，在收据中显示警告或确认
+        6. 检查最低配送金额限制，在收据中显示警告或确认
 
     Args:
         items (list): 菜品列表，来自 Gemini AI 的工具调用参数
@@ -143,10 +128,34 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
     # -----------------------------------------------------------------------
     # 步骤 1：逐一计算每个菜品的价格
     # -----------------------------------------------------------------------
-    for order_item in items:
-        name = order_item['name']          # 菜品名称
-        qty = order_item['quantity']       # 订购数量
-        opts = order_item.get('options', [])  # 已选选项（可能为空列表）
+    import re
+    
+    for item_raw in items:
+        # 如果 AI 还是传了原本的字典结构，说明它没有听从新 Schema，回退兼容
+        if isinstance(item_raw, dict):
+            name = item_raw.get('name', 'Unknown')
+            qty = item_raw.get('quantity', 1)
+            opts = item_raw.get('options', [])
+        else:
+            item_str = str(item_raw)
+            # 匹配数量 (可选的 Nx 或 N x 前缀)
+            qty_match = re.search(r'^(\d+)\s*x\s+', item_str, re.IGNORECASE)
+            qty = int(qty_match.group(1)) if qty_match else 1
+            
+            # 移除数量前缀
+            name_with_opts = item_str[qty_match.end():] if qty_match else item_str
+            
+            # 匹配选项 (括号内的内容，支持 with 或 without)
+            opts = []
+            opt_match = re.search(r'\((?:with\s+)?(.*?)\)', name_with_opts, re.IGNORECASE)
+            if opt_match:
+                # 提取括号里的内容，按逗号分割
+                opts_str = opt_match.group(1)
+                opts = [o.strip() for o in opts_str.split(',') if o.strip()]
+                # 从名字中移除括号及其内容
+                name = name_with_opts[:opt_match.start()].strip()
+            else:
+                name = name_with_opts.strip()
 
         # 在菜单数据库中查找此菜品（支持模糊匹配）
         db_item = database.find_item(name)

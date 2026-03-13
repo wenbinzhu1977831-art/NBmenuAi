@@ -179,11 +179,16 @@ async def search_address(address_query: str) -> dict:
 
     # --- 步骤1：决定搜索策略 ---
 
-    # 检查查询文本中是否已包含目标郡名
-    # 例如："123 Main Street, Drogheda, Co. Louth" 已含 "louth"
-    has_specified_county = any(c in query_lower for c in valid_counties)
-
-    # 检测 Eircode 格式：3个字母数字 + 可选空格 + 4个字母数字
+    # API Quirks: AutoAddress 经常无法识别完整的 "County Louth/Meath"，必须缩写为 "Co."
+    # AI 语音转文本经常带上 County，我们需要在此做标准化替换
+    address_query = address_query.replace("County ", "Co. ")
+    
+    # 分析查询文本，决定采用哪种搜索策略
+    # 扩大匹配范围，包括 "county louth" 和 "county meath" 防止重复拼接
+    query_lower = address_query.lower()
+    has_specified_county = any(c in query_lower for c in ["co. louth", "louth", "co. meath", "meath"])
+    
+    # 提取 Eircode (支持带空格的 7 位格式，如 A92 YDW7 或 A92YDW7)
     # 例如：A91 X123、D01 F5P2、A91X123
     eircode_match = re.search(r'\b([A-Za-z0-9]{3})\s?([A-Za-z0-9]{4})\b', address_query)
     
