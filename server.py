@@ -2829,11 +2829,18 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                     logger.error(f"工具 {name} 执行失败: {e}")
                                     result = {"error": str(e)}
 
+                                # 修复 Bug: 如果 result 已经是字典（如 {"result": "..."}, {"error": "..."}），直接解包使用
+                                # 否则，对于旧设计的回退包裹为 {"result": result}
+                                if isinstance(result, dict):
+                                    _response_payload = {**result}
+                                else:
+                                    _response_payload = {"result": result}
+
                                 # 对于 NON_BLOCKING 工具，加入 scheduling: INTERRUPT 让 AI 立即剥报结果
                                 _scheduling = "INTERRUPT" if name in ("search_address", "get_past_order") else None
-                                _response_payload = {"result": result}
                                 if _scheduling:
                                     _response_payload["scheduling"] = _scheduling
+                                    
                                 function_responses.append({
                                     "id": call_id,
                                     "name": name,
