@@ -50,16 +50,18 @@ definition = {
                 "properties": {
 
                     # 订购菜品列表
-                    # 修改为简单的字符串列表，防止原生语音大模型在生成深层嵌套 JSON 时触发 Google 后端 1011 崩溃
+                    # 修改为带有严格分隔符的字符串列表，防止原生语音大模型在生成深层嵌套 JSON 时崩溃，也方便后端精准切割
                     "items": {
                         "type": "array",
                         "items": {
                             "type": "string"
                         },
                         "description": (
-                            "List of items ordered with options and quantities. "
-                            "Format each string as: '[Quantity]x [Item Name] (with [Options])'. "
-                            "Example: '2x Large Munchie Box (with Fried Rice, Extra Hot)', '1x Can of Coke'"
+                            "List of items ordered. You MUST format EACH string exactly as: "
+                            "'QUANTITY | ITEM_NAME | OPTION_1, OPTION_2' "
+                            "Use EXACTLY the pipe symbol '|' to separate the three parts. "
+                            "Example 1: '2 | Large Munchie Box | Fried Rice, Extra Hot' "
+                            "Example 2: '1 | Can of Coke | None'"
                         )
                     },
 
@@ -128,8 +130,6 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
     # -----------------------------------------------------------------------
     # 步骤 1：逐一计算每个菜品的价格
     # -----------------------------------------------------------------------
-    import re
-    
     for item_raw in items:
         # 如果 AI 还是传了原本的字典结构，说明它没有听从新 Schema，回退兼容
         if isinstance(item_raw, dict):
@@ -138,24 +138,24 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
             opts = item_raw.get('options', [])
         else:
             item_str = str(item_raw)
-            # 匹配数量 (可选的 Nx 或 N x 前缀)
-            qty_match = re.search(r'^(\d+)\s*x\s+', item_str, re.IGNORECASE)
-            qty = int(qty_match.group(1)) if qty_match else 1
+            parts = [p.strip() for p in item_str.split('|')]
             
-            # 移除数量前缀
-            name_with_opts = item_str[qty_match.end():] if qty_match else item_str
+            # 1. 解析数量 (默认 1)
+            qty = 1
+            if len(parts) > 0:
+                qty_str = parts[0].replace('x', '').replace('X', '').strip()
+                if qty_str.isdigit():
+                    qty = int(qty_str)
+                    
+            # 2. 解析名称: 如果切片有两段以上，取第二段；否则把整个乱七八糟的串当名字
+            name = parts[1] if len(parts) > 1 else item_str.replace('|', '').strip()
             
-            # 匹配选项 (括号内的内容，支持 with 或 without)
+            # 3. 解析选项: 如果切片有三段以上且不为空、不是 None，按逗号切分
             opts = []
-            opt_match = re.search(r'\((?:with\s+)?(.*?)\)', name_with_opts, re.IGNORECASE)
-            if opt_match:
-                # 提取括号里的内容，按逗号分割
-                opts_str = opt_match.group(1)
-                opts = [o.strip() for o in opts_str.split(',') if o.strip()]
-                # 从名字中移除括号及其内容
-                name = name_with_opts[:opt_match.start()].strip()
-            else:
-                name = name_with_opts.strip()
+            if len(parts) > 2:
+                opt_str = parts[2].lower()
+                if opt_str not in ['none', '', 'n/a', 'null']:
+                    opts = [o.strip() for o in parts[2].split(',') if o.strip()]
 
         # 在菜单数据库中查找此菜品（支持模糊匹配）
         db_item = database.find_item(name)
@@ -219,8 +219,14 @@ def _calculate_total_impl(items: list, delivery_fee: float, payment_method: str)
                     enriched_options.append({'name': user_opt, 'price_adjustment': 0.0})
 
         # 计算该菜品的行总计
-        order_item['unit_price'] = item_total
-        order_item['options'] = enriched_options
+        if isinstance(item_raw, dict):
+            item_raw['unit_price'] = item_total
+            item_raw['options'] = enriched_options
+        else:
+            # 对于纯字符串输入格式，虽然不需要原地修改原数组也可以正确算出总额，
+            # 这里留空因为外层函数如果需要也可以通过字符串分割再反向构造列表
+            pass
+            
         line_total = item_total * qty
         total_price += line_total
 
