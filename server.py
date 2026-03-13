@@ -2728,8 +2728,10 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                             "subtotal": result.get('subtotal', 0.0),
                                             "total": result.get('total', 0.0)
                                         }
+                                        
                                         await broadcast_admin("live_order_update", draft_order)
-                                        result = result.get('result', "Total calculated.") # WebSim expects result inner dict
+                                        
+                                        # [BUG FIX] 移除 result = result.get('result', ...) 避免破坏 dict 结构，直接作为 json 对象返回给 Gemini
                                     elif name == 'get_past_order':
                                         o_id = args.get('order_id')
                                         result = tools_history.get_past_order(o_id)
