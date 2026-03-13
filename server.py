@@ -2736,8 +2736,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                         result = result.get('result', "Total calculated.") # WebSim expects result inner dict
                                     elif name == 'get_past_order':
                                         o_id = args.get('order_id')
-                                        result_dict = tools_history.get_past_order(o_id)
-                                        result = result_dict.get('result', "No history found.")
+                                        result = tools_history.get_past_order(o_id)
                                     elif name == 'get_business_hours':
                                         result = prompts.get_business_hours() if hasattr(prompts, 'get_business_hours') else {"error": "Not implemented"}
                                     elif name == 'get_restaurant_status':
@@ -2829,18 +2828,18 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                     logger.error(f"工具 {name} 执行失败: {e}")
                                     result = {"error": str(e)}
 
-                                # 修复 Bug: 如果 result 已经是字典（如 {"result": "..."}, {"error": "..."}），直接解包使用
-                                # 否则，对于旧设计的回退包裹为 {"result": result}
+                                # 对于返回复杂字典的工具（如 search_address, calculate_total），直接作为 payload 送回
+                                # 否则（如简单的字符串），装入 {"result": ...} 中送回
                                 if isinstance(result, dict):
-                                    _response_payload = {**result}
+                                    _response_payload = result.copy()
                                 else:
-                                    _response_payload = {"result": result}
+                                    _response_payload = {"result": str(result)}
 
-                                # 对于 NON_BLOCKING 工具，加入 scheduling: INTERRUPT 让 AI 立即剥报结果
+                                # 针对 NON_BLOCKING 工具注入 scheduling 调度指令
                                 _scheduling = "INTERRUPT" if name in ("search_address", "get_past_order") else None
                                 if _scheduling:
                                     _response_payload["scheduling"] = _scheduling
-                                    
+
                                 function_responses.append({
                                     "id": call_id,
                                     "name": name,
@@ -2867,8 +2866,12 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                     "responses": function_responses
                                 })
 
-                except ConnectionClosed:
-                    logger.info("Gemini (Web) WebSocket 断开（Gemini 端关闭会话）")
+                except ConnectionClosed as e:
+                    close_code = e.rcvd.code if e.rcvd else "unknown"
+                    close_reason = e.rcvd.reason if e.rcvd else "no reason"
+                    logger.warning(
+                        f"⚠️ Gemini (Web) WebSocket 断开 (code={close_code}): {close_reason}"
+                    )
                     try:
                         await websocket.send_json({
                             "event": "gemini_disconnect",
