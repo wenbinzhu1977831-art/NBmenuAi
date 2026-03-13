@@ -1926,8 +1926,7 @@ async def handle_media_stream(websocket: WebSocket):
                                     "name": "search_address",
                                     "id": call['id'],
                                     "response": {
-                                        "result": result,
-                                        "scheduling": "INTERRUPT"  # NON_BLOCKING: 立即打断啄报结果
+                                        "result": result
                                     }
                                 })
 
@@ -2091,10 +2090,7 @@ async def handle_media_stream(websocket: WebSocket):
                                 function_responses.append({
                                     "name": "get_past_order",
                                     "id": call['id'],
-                                    "response": {
-                                        **result,
-                                        "scheduling": "INTERRUPT"  # NON_BLOCKING: 历史订单查到后立即打断啄报
-                                    }
+                                    "response": result
                                 })
 
                         # 将所有工具的返回结果批量发回给 Gemini
@@ -2834,11 +2830,6 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                     _response_payload = result.copy()
                                 else:
                                     _response_payload = {"result": str(result)}
-
-                                # 针对 NON_BLOCKING 工具注入 scheduling 调度指令
-                                _scheduling = "INTERRUPT" if name in ("search_address", "get_past_order") else None
-                                if _scheduling:
-                                    _response_payload["scheduling"] = _scheduling
 
                                 function_responses.append({
                                     "id": call_id,
