@@ -2891,7 +2891,7 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
         logger.error(f"Web 模拟通话全局异常: {e}")
     finally:
         # ★ WebRTC 草稿订单救援：若模拟通话中途丢失连接，同样挽救订单
-        if not order_finalized and stream_call_sid and draft_order:
+        if not order_finalized and stream_call_sid:
             try:
                 rescue_id = f"AID-INCOMPLETE-{int(time.time())}"
                 rescue_record = {

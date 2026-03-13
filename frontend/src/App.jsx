@@ -462,9 +462,11 @@ function App() {
         } else if (msg.event === 'call_start') {
           setActiveCallCount(msg.data.active_count);
           setActiveCallsList(msg.data.active_calls || {});
-          // 不立刻清空小票和转写 — 等新通话的第一条转写到达再清
+          // 新通话开始：立即清空实时小票和对话记录（含错误信息）
+          setLiveOrder(null);
+          setTranscripts({});
           setActiveViewCallSid(msg.data.call_sid);
-          
+
         } else if (msg.event === 'call_end') {
           setActiveCallCount(msg.data.active_count);
           setActiveCallsList(msg.data.active_calls || {});
