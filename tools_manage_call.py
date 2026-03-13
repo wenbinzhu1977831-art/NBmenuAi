@@ -43,8 +43,11 @@ tool_definition = {
         {
             "name": "end_call",
             "description": (
-                "End the call. Use this when the order is complete OR anonymous caller refused. "
-                "FOR COMPLETED ORDERS, YOU MUST PROVIDE ORDER DETAILS."
+                "End the call and submit the order. "
+                "**Invocation Condition:** Call this ONLY ONCE, immediately after "
+                "the customer has confirmed their complete order AND you have finished "
+                "saying 'Thank you, goodbye'. Never call mid-conversation or before farewell. "
+                "FOR COMPLETED ORDERS, YOU MUST PROVIDE ALL ORDER DETAILS."
             ),
             "parameters": {
                 "type": "object",
@@ -170,8 +173,11 @@ tool_definition = {
         {
             "name": "transfer_call",
             "description": (
-                "Transfer the call to a human manager. Use this if the user is confused, "
-                "angry, asks for a human, or if the request is outside your capability."
+                "Transfer the call to a human manager. "
+                "**Invocation Condition:** Call this ONLY if: (a) customer explicitly asks "
+                "for a human/manager, (b) customer is persistently angry or complaining, "
+                "(c) request is clearly outside your capability. Say "
+                "'I'll transfer you now, please hold' before calling."
             ),
             "parameters": {
                 "type": "object",

@@ -40,7 +40,10 @@ definition = {
             "description": (
                 "Calculate the final order total including delivery fees, "
                 "option costs, and payment surcharges. "
-                "Use this BEFORE confirming the order."
+                "**Invocation Condition:** Call this EXACTLY ONCE, only after "
+                "the customer has finished ordering ALL items AND stated their "
+                "service type (Delivery/Pickup) AND payment method. "
+                "Never call mid-order or more than once."
             ),
             "parameters": {
                 "type": "object",

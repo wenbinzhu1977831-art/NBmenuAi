@@ -1924,8 +1924,11 @@ async def handle_media_stream(websocket: WebSocket):
 
                                 function_responses.append({
                                     "name": "search_address",
-                                    "id": call['id'],  # 必须与请求的 id 匹配
-                                    "response": {"result": result}
+                                    "id": call['id'],
+                                    "response": {
+                                        "result": result,
+                                        "scheduling": "INTERRUPT"  # NON_BLOCKING: 立即打断啄报结果
+                                    }
                                 })
 
                             # ---- 工具 2：价格计算 ----
@@ -2088,7 +2091,10 @@ async def handle_media_stream(websocket: WebSocket):
                                 function_responses.append({
                                     "name": "get_past_order",
                                     "id": call['id'],
-                                    "response": result
+                                    "response": {
+                                        **result,
+                                        "scheduling": "INTERRUPT"  # NON_BLOCKING: 历史订单查到后立即打断啄报
+                                    }
                                 })
 
                         # 将所有工具的返回结果批量发回给 Gemini
@@ -2297,12 +2303,18 @@ async def send_setup_message(
                         }
                     }
                 }
-                # "thinkingConfig" was removed here. Google's default thinking behavior will be restored, making the AI smarter.
             },
+            # 启用上下文窗口压缩：原生音频每秒～25 tokens，不压缩 15 分钟就会超限
+            # 启用滑动窗口将会话延长至无限
+            "contextWindowCompression": {
+                "slidingWindow": {},
+                "triggerTokens": 25600  # ~17分钟音频后触发压缩
+            },
+            # 启用会话恢复：10分钟连接重置时能续接上下文
+            "sessionResumption": {},
             # 启用用户语音实时转录（STT → inputTranscription 事件）
             "inputAudioTranscription": {},
             # 启用 AI 语音输出转录（AI 说了什么 → outputTranscription 事件）
-            # 这样管理面板可以实时显示 AI 所说内容的文字版本
             "outputAudioTranscription": {},
             "systemInstruction": {
                 "parts": [{"text": base_instruction}]
@@ -2551,6 +2563,18 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                         response = json.loads(message)
 
                         audio_data_parts = []
+
+                        # 检测 GoAway 信号（Gemini 会话即将超时的预警）
+                        if 'goAway' in response:
+                            time_left = response['goAway'].get('timeLeft', 'unknown')
+                            logger.warning(
+                                f"⚠️ [WebRTC] Gemini goAway: 会话将在 {time_left} 后终止"
+                            )
+                            await broadcast_admin("system_log", {
+                                "message": f"⚠️ Gemini 会话即将超时 (剩余: {time_left})，通话可能即将断开",
+                                "type": "error"
+                            })
+
 
                         if 'serverContent' in response:
                             server_content = response['serverContent']
@@ -2805,10 +2829,15 @@ async def handle_web_call_stream(websocket: WebSocket, token: str = None):
                                     logger.error(f"工具 {name} 执行失败: {e}")
                                     result = {"error": str(e)}
 
+                                # 对于 NON_BLOCKING 工具，加入 scheduling: INTERRUPT 让 AI 立即剥报结果
+                                _scheduling = "INTERRUPT" if name in ("search_address", "get_past_order") else None
+                                _response_payload = {"result": result}
+                                if _scheduling:
+                                    _response_payload["scheduling"] = _scheduling
                                 function_responses.append({
                                     "id": call_id,
                                     "name": name,
-                                    "response": {"result": result}
+                                    "response": _response_payload
                                 })
 
                             # 将工具结果发回给 Gemini

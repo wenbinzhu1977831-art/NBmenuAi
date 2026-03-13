@@ -46,21 +46,18 @@ tool_definition = {
     "function_declarations": [
         {
             "name": "search_address",
-            # 触发说明：
-            #   - 客户提供了一个地址字符串
-            #   - 客户提供了 Eircode（爱尔兰邮编，如 "A91 X123"）
-            #   - 需要验证该地址是否在配送范围内
+            "behavior": "NON_BLOCKING",
             "description": (
-                "Search for a valid address in Ireland using the AutoAddress API. "
-                "Use this when the user provides an address, an Eircode, "
-                "or asks to check if an address is valid."
+                "Search for a valid delivery address in Ireland using the AutoAddress API. "
+                "**Invocation Condition:** Call this tool ONLY when the customer has stated "
+                "their full delivery address or Eircode. Do NOT call it for pickup orders. "
+                "Say 'Just looking that up for you...' before calling, then report the result."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "address_query": {
                         "type": "string",
-                        # AI 应将客户口述的完整地址文本传入此参数
                         "description": (
                             "The address string or query provided by the user "
                             "(e.g., '123 Main St, Dublin' or 'A91 X123')."

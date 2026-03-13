@@ -37,33 +37,26 @@ logger = logging.getLogger("AI-Waiter")
 definition = {
     "function_declarations": [
         {
-            # 函数名称：与下方 Python 函数名及 server.py 中的 call['name'] 判断保持一致
             "name": "get_past_order",
-
-            # 触发时机描述：告知 AI 在什么场景下应该调用此函数
-            # - 客户说"same as last time"（老样子）
-            # - 客户提供了某个订单编号（order #1234）
+            "behavior": "NON_BLOCKING",
             "description": (
                 "Retrieve details of a past order using its Order ID. "
-                "Use this when a customer wants to repeat a previous order "
-                "(e.g., 'same as last time' or 'order #1234')."
+                "**Invocation Condition:** Call this ONLY when the customer says "
+                "'same as last time', 'repeat my last order', or references a specific order ID. "
+                "Extract the order_id from the Order History section in your context. "
+                "Say 'Give me a moment to pull that up...' before calling."
             ),
-
             "parameters": {
                 "type": "object",
                 "properties": {
                     "order_id": {
                         "type": "string",
-                        # 告知 AI 如何获取 order_id：
-                        # 优先从客户的 Order History（系统提示词中已注入）提取，
-                        # 也可以从对话上下文中获取客户报出的订单号
                         "description": (
                             "The unique ID of the order (e.g., 'ORD-1766856461-2866'). "
-                            "Extract this from the context or customer history."
+                            "Extract this from the Order History in context or from the customer."
                         )
                     }
                 },
-                # order_id 是此工具的唯一必填参数
                 "required": ["order_id"]
             }
         }
